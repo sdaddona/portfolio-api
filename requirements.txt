@@ -1,9 +1,13 @@
+flask
+gunicorn
 fastapi
 uvicorn[standard]
 pandas
 numpy
 yfinance
 pandas-datareader
+matplotlib
 playwright
 beautifulsoup4
+requests
 
