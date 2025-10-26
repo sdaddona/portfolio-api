@@ -1,39 +1,22 @@
 # server.py
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
+from portfolio_core import run_full_analysis
 
-app = FastAPI(
-    title="Portfolio API",
-    description="API di test: il backend è vivo su Render",
-    version="0.0.1",
-)
+app = FastAPI(title="Portfolio Analyzer API")
 
-# --- MODELLI -------------------------------------------------
-class HealthResponse(BaseModel):
-    status: str
-    note: str
+class LotsRequest(BaseModel):
+    lots_text: str
+    bench: str = "VT"
 
-# --- ENDPOINTS ----------------------------------------------
-
-@app.get("/health", response_model=HealthResponse)
-def healthcheck():
+@app.post("/analyze")
+def analyze(req: LotsRequest):
     """
-    Semplice endpoint per verificare che l'app giri su Render.
-    Nessuna analisi, nessun Playwright.
+    Esegue l'analisi del portafoglio con i lotti passati dal frontend.
     """
-    return HealthResponse(
-        status="ok",
-        note="Render is running 👍"
-    )
+    result = run_full_analysis(req.lots_text, req.bench)
+    return result
 
-@app.get("/")
-def root():
-    # homepage JSON minimale
-    return {
-        "message": "Portfolio API online",
-        "next": {
-            "/health": "stato servizio",
-            "/analyze (coming soon)": "analisi portafoglio"
-        }
-    }
-
+@app.get("/health")
+def health():
+    return {"status": "ok"}
