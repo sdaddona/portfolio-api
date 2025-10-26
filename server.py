@@ -1,22 +1,34 @@
-# server.py
-from fastapi import FastAPI, Query
-from pydantic import BaseModel
+import os
+from flask import Flask, request, jsonify
 from portfolio_core import run_full_analysis
 
-app = FastAPI(title="Portfolio Analyzer API")
+app = Flask(__name__)
 
-class LotsRequest(BaseModel):
-    lots_text: str
-    bench: str = "VT"
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "ok", "message": "portfolio API online"})
 
-@app.post("/analyze")
-def analyze(req: LotsRequest):
+@app.route("/analyze", methods=["POST"])
+def analyze():
     """
-    Esegue l'analisi del portafoglio con i lotti passati dal frontend.
+    Expects JSON like:
+    {
+        "lots_text": "ACWI 2024-01-02 10 100\nVT 2024-01-03 5 90\n...",
+        "bench": "VT"
+    }
+    Returns summary data.
     """
-    result = run_full_analysis(req.lots_text, req.bench)
-    return result
+    data = request.get_json(silent=True) or {}
+    lots_text = data.get("lots_text", "")
+    bench = data.get("bench", "VT")
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    try:
+        result = run_full_analysis(lots_text, bench)
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    # local debug
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
