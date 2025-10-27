@@ -251,29 +251,26 @@ def aggregate_allocations_portfolio(shares_df: pd.DataFrame,
 ###############################################################################
 # Download prezzi da Alpha Vantage
 ###############################################################################
-
 def download_price_history_av(ticker: str,
                               start: pd.Timestamp,
                               end: pd.Timestamp) -> pd.Series | None:
-    """
-    Chiede a Alpha Vantage TIME_SERIES_DAILY_ADJUSTED.
-    Ritorna una Series 'Close' (in realtà 'adjusted close') indicizzata per data,
-    oppure None se fallisce / vuota.
-    """
     api_key = os.getenv("ALPHAVANTAGE_KEY", "").strip()
+    print("DEBUG AlphaVantage KEY OK:", bool(api_key), "ticker:", ticker, flush=True)
+
     if api_key == "":
-        return None  # se qualcuno lancia senza chiave in locale
+        return None
 
     url = "https://www.alphavantage.co/query"
     params = {
         "function": "TIME_SERIES_DAILY_ADJUSTED",
         "symbol": ticker,
-        "outputsize": "full",   # prendiamo storico lungo
+        "outputsize": "full",
         "apikey": api_key,
     }
 
     try:
         r = requests.get(url, params=params, timeout=10)
+        print("DEBUG AlphaVantage status:", r.status_code, "body:", r.text[:300], flush=True)
     except Exception:
         return None
 
