@@ -1,8 +1,15 @@
 Flask==3.0.3
 gunicorn==23.0.0
-pandas==2.2.2
+
+# numerics
 numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.9.2
+
+# data sources
 yfinance==0.2.43
-pandas-datareader==0.10.0
 requests==2.32.3
+
+# opzionali/safe da rimuovere se vuoi il minimo indispensabile:
+pandas-datareader==0.10.0
 beautifulsoup4==4.12.3
