@@ -1,7 +1,9 @@
 Flask==3.0.3
 gunicorn==23.0.0
 pandas==2.2.2
-numpy==2.1.1
-yfinance==0.2.44
-matplotlib==3.9.0
+numpy==1.26.4
+yfinance==0.2.43
+pandas-datareader==0.10.0
 requests==2.32.3
+beautifulsoup4==4.12.3
+playwright==1.47.2
