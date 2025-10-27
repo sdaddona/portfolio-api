@@ -1,325 +1,355 @@
-# portfolio_analysis_web.py
-#
-# Versione robusta per deploy su Render (Docker).
-# - Scarico prezzi via yfinance con retry e lookback esteso
-# - Fallback benchmark se Yahoo non risponde subito
-# - Genero output JSON strutturato + grafico PNG
-#
-# Assunzioni:
-# - lots_text è tipo:
-#     VT 2024-01-02 10 100
-#     VT 2024-03-10 5 95
-#   cioè: <ticker> <YYYY-MM-DD> <qty> <price_paid>
-#
-# - bench è un ticker Yahoo (es. "VT")
-#
-# Output principale:
-# {
-#   "ok": true,
-#   "summary_lines": [...],
-#   "pme": {...},
-#   "risk": {...},
-#   "alloc": {...},
-#   "plot_path": "/tmp/outputs/crescita_cumulata.png"
-# }
-#
-# NOTE:
-# - Alcune metriche (PME, VaR, Sharpe) qui sono implementate in modo
-#   ragionevole/simplificato per avere qualcosa di funzionante e stabile.
-#   Se la tua versione locale calcola cose più raffinate (tipo IRR esatto),
-#   puoi reincollarle 1:1 all'interno dei placeholder segnati sotto.
-
-
 import os
+import re
+import time
 import math
+import requests
 from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # headless render
 import matplotlib.pyplot as plt
+import yfinance as yf
 
-# ----------------------------------------------------------------------
-# 1. Utility: parsing input lotti
-# ----------------------------------------------------------------------
+TRADING_DAYS = 252
 
-def parse_lots_text(lots_text: str):
+
+###############################################################################
+# Utils base
+###############################################################################
+
+def to_naive(obj):
     """
-    Converte il testo dei lotti in un DataFrame con colonne:
-    ['ticker', 'date', 'qty', 'price']
+    Rimuove timezone dagli indici datetime di Series/DataFrame (operando in place).
     """
-    rows = []
-    for raw_line in lots_text.strip().splitlines():
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        parts = raw_line.split()
-        # atteso: TICKER DATE QTY PRICE
-        # es: VT 2024-01-02 10 100
-        if len(parts) != 4:
-            # se non matcha, salto la riga
-            continue
-        ticker, date_str, qty_str, price_str = parts
+    if isinstance(obj, (pd.Series, pd.DataFrame)) and isinstance(obj.index, pd.DatetimeIndex):
         try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d").date()
-            qty = float(qty_str.replace(",", "."))
-            prc = float(price_str.replace(",", "."))
+            obj.index = obj.index.tz_localize(None)
         except Exception:
+            pass
+    return obj
+
+
+def to_date(s: str) -> pd.Timestamp:
+    """
+    Prova a interpretare una stringa come data.
+    Supporta "YYYY-MM-DD" oppure formati comuni tipo "DD/MM/YYYY".
+    Restituisce un Timestamp naive (senza tz).
+    """
+    s = str(s).strip()
+    dt = pd.to_datetime(s, errors="coerce", utc=False)
+    if pd.isna(dt):
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True, utc=False)
+    if pd.isna(dt):
+        raise ValueError(f"Data non riconosciuta: {s}")
+    try:
+        return dt.tz_localize(None)
+    except Exception:
+        return dt
+
+
+def money(x: float) -> str:
+    return f"{x:,.2f} USD"
+
+
+def fmt_pct(x):
+    if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
+        return "n/a"
+    return f"{x:.2%}"
+
+
+def xnpv(r, cf):
+    """
+    Valore attuale netto di una serie di flussi cf = [(date, amount), ...]
+    r è il tasso annuo.
+    """
+    t0 = cf[0][0]
+    return sum(a / (1 + r) ** ((t - t0).days / 365.25) for t, a in cf)
+
+
+def xirr(cf):
+    """
+    IRR dei flussi cf (date crescenti).
+    Se non ci sono sia flussi positivi sia negativi → NaN.
+    """
+    has_pos = any(a > 0 for _, a in cf)
+    has_neg = any(a < 0 for _, a in cf)
+    if not (has_pos and has_neg):
+        return np.nan
+
+    lo, hi = -0.999, 10.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        val = xnpv(mid, cf)
+        if abs(val) < 1e-8:
+            return mid
+        if xnpv(lo, cf) * val <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return mid
+
+
+###############################################################################
+# Lettura lotti dalla textarea
+###############################################################################
+
+def read_lots_from_text(txt: str) -> pd.DataFrame:
+    """
+    txt deve avere righe tipo:
+      TICKER DATA QUANTITA PREZZO
+      VT 2024-01-02 10 100
+      VT 2024-03-10 5 95
+
+    Ritorna DataFrame con colonne:
+    ticker (str), data (Timestamp), quantità (float), prezzo (float)
+    """
+    lines = []
+    for ln in txt.splitlines():
+        ln_strip = ln.strip()
+        if not ln_strip or ln_strip.startswith("#"):
             continue
-        rows.append({
-            "ticker": ticker.upper(),
-            "date": dt,
-            "qty": qty,
-            "price": prc,
-        })
-    if not rows:
-        return pd.DataFrame(columns=["ticker","date","qty","price"])
-    df = pd.DataFrame(rows)
+        lines.append(ln_strip)
+    if not lines:
+        raise ValueError("Nessuna riga valida nei lotti.")
+
+    rows = []
+    for ln in lines:
+        parts = re.split(r"[,\t;]+|\s+", ln.strip())
+        if len(parts) < 4:
+            raise ValueError(f"Riga lotti invalida: {ln}")
+        ticker = parts[0].upper()
+        data = to_date(parts[1])
+        qty = float(str(parts[2]).replace(",", "."))
+        px = float(str(parts[3]).replace(",", "."))
+        rows.append((ticker, data, qty, px))
+
+    df = pd.DataFrame(rows, columns=["ticker","data","quantità","prezzo"])
+    df = df.sort_values("data").reset_index(drop=True)
     return df
 
 
-# ----------------------------------------------------------------------
-# 2. Download prezzi robusto
-# ----------------------------------------------------------------------
+###############################################################################
+# Risk-free da FRED API (con fallback fisso)
+###############################################################################
 
-def try_symbol(ticker: str,
-               min_history_days: int = 365,
-               max_lookback_years: int = 10):
+def fetch_fred_series(series_id: str,
+                      start_date: pd.Timestamp,
+                      end_date: pd.Timestamp,
+                      api_key: str | None) -> pd.Series:
     """
-    Scarica storico daily da Yahoo Finance per `ticker`.
-    Fa più tentativi di lookback, restituisce DataFrame index datetime
-    con colonna 'Close', oppure None se proprio non trova prezzi.
-
-    - Primo tentativo: ~1 anno di dati
-    - Secondo tentativo: fino a ~10 anni
+    Scarica serie FRED (es. DGS1: 1Y Treasury yield, % annuo) e
+    restituisce una pandas.Series indicizzata per data.
+    In caso di errore: Series vuota.
     """
-    end = datetime.utcnow().date()
-    start_candidates = [
-        end - timedelta(days=min_history_days),
-        end - timedelta(days=365 * max_lookback_years),
-    ]
+    if api_key is None or api_key.strip() == "":
+        return pd.Series(dtype=float)
 
-    for start in start_candidates:
+    base_url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": start_date.strftime("%Y-%m-%d"),
+        "observation_end": end_date.strftime("%Y-%m-%d"),
+    }
+
+    try:
+        r = requests.get(base_url, params=params, timeout=10)
+        if r.status_code != 200:
+            return pd.Series(dtype=float)
+        data = r.json().get("observations", [])
+    except Exception:
+        return pd.Series(dtype=float)
+
+    dates = []
+    vals = []
+    for obs in data:
+        dstr = obs.get("date")
+        vstr = obs.get("value")
+        if vstr in (None, ".", ""):
+            continue
         try:
-            df = yf.download(
-                ticker,
-                start=start.isoformat(),
-                end=end.isoformat(),
-                interval="1d",
-                progress=False,
-                auto_adjust=True,
-                threads=True,
-            )
+            d = pd.to_datetime(dstr).tz_localize(None)
+            v = float(vstr)
         except Exception:
-            df = None
+            continue
+        dates.append(d)
+        vals.append(v)
 
-        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
-            out = df[["Close"]].copy()
-            out = out.dropna()
-            if not out.empty:
-                # Normalizza in modo che l'indice sia datetime.date coerente
-                out.index = pd.to_datetime(out.index).tz_localize(None)
-                out = out.sort_index()
-                return out
+    if not dates:
+        return pd.Series(dtype=float)
 
-    # Se nessun tentativo ha prodotto dati validi:
+    ser = pd.Series(vals, index=pd.DatetimeIndex(dates)).sort_index()
+    return ser
+
+
+def build_rf_daily_series_web(index: pd.DatetimeIndex,
+                              fallback_annual_rf: float = 0.04) -> tuple[pd.Series, str]:
+    """
+    Ritorna:
+    - rf_daily: Series dell'rf giornaliero (frazzionale tipo 0.0001)
+    - rf_meta: descrizione stringa usata nei summary
+
+    1) prova DGS1 (1Y Treasury yield) da FRED
+    2) se non disponibile → fallback costante, es. 4% annuo
+    """
+    api_key = os.getenv("FRED_API_KEY", "").strip()
+    start_fetch = index[0] - pd.Timedelta(days=10)
+    end_fetch   = index[-1] + pd.Timedelta(days=3)
+
+    dgs1 = fetch_fred_series("DGS1", start_fetch, end_fetch, api_key)
+    if not dgs1.empty:
+        dgs1 = dgs1.reindex(index).ffill()
+        rf_annual = dgs1 / 100.0  # es. 4.2 -> 0.042
+        rf_daily = rf_annual / TRADING_DAYS
+        rf_meta = "RF: FRED DGS1 (1Y Treasury, ann.)"
+        return rf_daily, rf_meta
+
+    rf_daily = pd.Series(fallback_annual_rf / TRADING_DAYS, index=index)
+    rf_meta = f"Fixed RF {fallback_annual_rf:.2%} (ann., fallback)"
+    return rf_daily, rf_meta
+
+
+###############################################################################
+# Allocazioni ETF (stub su Render)
+###############################################################################
+
+def get_etf_allocations(ticker: str):
+    """
+    Stub: su Render free non possiamo fare scraping headless serio.
+    Ritorna due DataFrame vuoti (settori, paesi).
+    """
+    return (
+        pd.DataFrame(columns=["label","weight"]),
+        pd.DataFrame(columns=["label","weight"]),
+    )
+
+
+def aggregate_allocations_portfolio(shares_df: pd.DataFrame,
+                                    prices_df: pd.DataFrame,
+                                    tickers: list[str],
+                                    bench: str):
+    """
+    Combina le allocazioni ETF pesandole per il peso di mercato nel portafoglio.
+    Su Render → spesso vuoto, ed è ok.
+    """
+    end_date = shares_df.index[-1]
+    mv = shares_df.loc[end_date] * prices_df.loc[end_date, shares_df.columns]
+    w_etf = (mv / mv.sum()).fillna(0.0)
+    w_etf = w_etf[w_etf > 0]
+
+    sector_rows, country_rows = [], []
+
+    for etf, w in w_etf.items():
+        s_df, c_df = get_etf_allocations(etf)
+        if not s_df.empty:
+            tmp = s_df.copy()
+            tmp["weight_portfolio"] = w * tmp["weight"]
+            tmp["etf"] = etf
+            sector_rows.append(tmp[["etf", "label", "weight_portfolio"]])
+        if not c_df.empty:
+            tmpc = c_df.copy()
+            tmpc["weight_portfolio"] = w * tmpc["weight"]
+            tmpc["etf"] = etf
+            country_rows.append(tmpc[["etf", "label", "weight_portfolio"]])
+        time.sleep(0.05)
+
+    if sector_rows:
+        sectors = (
+            pd.concat(sector_rows)
+              .groupby("label", as_index=False)["weight_portfolio"].sum()
+              .sort_values("weight_portfolio", ascending=False)
+              .reset_index(drop=True)
+        )
+    else:
+        sectors = pd.DataFrame(columns=["label","weight_portfolio"])
+
+    if country_rows:
+        countries = (
+            pd.concat(country_rows)
+              .groupby("label", as_index=False)["weight_portfolio"].sum()
+              .sort_values("weight_portfolio", ascending=False)
+              .reset_index(drop=True)
+        )
+    else:
+        countries = pd.DataFrame(columns=["label","weight_portfolio"])
+
+    def norm(df):
+        if df.empty:
+            return df
+        tot = df["weight_portfolio"].sum()
+        if tot > 0:
+            df = df.copy()
+            df["weight_portfolio"] = df["weight_portfolio"] / tot
+        return df
+
+    return norm(sectors), norm(countries)
+
+
+###############################################################################
+# Download prezzi robusto con retry
+###############################################################################
+
+def download_price_history(ticker: str,
+                           start: pd.Timestamp,
+                           end: pd.Timestamp):
+    """
+    Scarica storico daily con yfinance (auto_adjust=True).
+    Restituisce una Series Close indicizzata per data (tz naive), ffillata.
+    Se vuoto -> None.
+    """
+    try:
+        h = yf.Ticker(ticker).history(
+            start=start,
+            end=end,
+            interval="1d",
+            auto_adjust=True
+        )
+    except Exception:
+        return None
+
+    if h is None or h.empty or "Close" not in h.columns:
+        return None
+
+    s = h["Close"].rename(ticker).sort_index().ffill()
+    s = to_naive(s)
+    return s
+
+
+def robust_fetch_prices_for_symbol(sym: str,
+                                   first_tx_date: pd.Timestamp,
+                                   start_buffer_days: int = 7) -> pd.Series | None:
+    """
+    Tenta di ottenere la serie prezzi per un ticker, provando:
+    - il ticker "così com'è"
+    - suffissi comuni (.US, .L, .MI)
+    - lookback 1y poi 10y
+    Ritorna Series (index datetime, valori float) o None.
+    """
+    candidates = [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]
+    candidates = list(dict.fromkeys(candidates))  # dedup mantenendo ordine
+
+    starts = [
+        first_tx_date - timedelta(days=start_buffer_days + 365),
+        first_tx_date - timedelta(days=start_buffer_days + 365*10),
+    ]
+    end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
+
+    for ticker_candidate in candidates:
+        for st in starts:
+            s = download_price_history(ticker_candidate, st, end)
+            if s is not None and not s.empty:
+                # rinomina col ticker logico (sym) così rimane coerente nel portafoglio
+                return s.rename(sym)
+
     return None
 
 
-# ----------------------------------------------------------------------
-# 3. Costruzione della curva di portafoglio nel tempo
-# ----------------------------------------------------------------------
-
-def build_portfolio_nav(lots_df: pd.DataFrame,
-                        price_cache: dict):
-    """
-    Dato l'elenco dei lotti e un cache prezzi per ciascun ticker,
-    calcola la curva di valore del portafoglio (NAV) giorno per giorno.
-
-    price_cache: dict { ticker: DataFrame( index=datetime, Close=float ) }
-
-    Ritorna:
-    - nav_df: DataFrame con colonne ['portfolio_value'] indicizzato per data (datetime)
-    """
-
-    if lots_df.empty:
-        # se non hai lotti, ritorna vuoto
-        return pd.DataFrame(columns=["portfolio_value"])
-
-    # 1. costruiamo la serie delle posizioni nel tempo
-    #    per semplicità: assumiamo buy&hold (solo acquisti), nessuna vendita
-    #    quantity cumulata per ticker nel tempo
-    nav_by_date = {}
-
-    # timeline globale = unione di tutte le date prezzo di tutti i ticker
-    all_dates = set()
-    for tkr in lots_df["ticker"].unique():
-        px = price_cache.get(tkr)
-        if px is not None and not px.empty:
-            for d in px.index:
-                all_dates.add(d)
-
-    if not all_dates:
-        return pd.DataFrame(columns=["portfolio_value"])
-
-    all_dates = sorted(all_dates)
-
-    # per velocità, prepariamo le cumulative quantities per ticker
-    # idea: per ogni ticker, al giorno D, qty held = somma qty di tutte le operazioni con date <= D
-    ticker_lots = {
-        tkr: lots_df[lots_df["ticker"] == tkr].sort_values("date")
-        for tkr in lots_df["ticker"].unique()
-    }
-
-    # calcolo NAV giornaliero
-    for d in all_dates:
-        total_val = 0.0
-        for tkr, tdf in ticker_lots.items():
-            # qty cumulata fino a quel giorno
-            qty_held = tdf.loc[tdf["date"] <= d.date(), "qty"].sum()
-            if qty_held <= 0:
-                continue
-            px = price_cache.get(tkr)
-            if px is None or px.empty:
-                continue
-            # prezzo close del giorno d (se manca quel giorno, prendo ultimo disponibile <= d)
-            # forward-fill all'interno px
-            prc = px.loc[px.index <= d, "Close"]
-            if prc.empty:
-                continue
-            last_price = prc.iloc[-1]
-            total_val += qty_held * last_price
-
-        nav_by_date[d] = total_val
-
-    nav_df = (
-        pd.Series(nav_by_date)
-        .sort_index()
-        .to_frame(name="portfolio_value")
-    )
-    return nav_df
-
-
-# ----------------------------------------------------------------------
-# 4. Normalizza due curve per confronto (base 100)
-# ----------------------------------------------------------------------
-
-def base_100(series: pd.Series):
-    """
-    Porta la serie (tipicamente NAV o Close benchmark) a base 100
-    sul primo valore non-NaN.
-    """
-    s = series.dropna().astype(float)
-    if s.empty:
-        return s
-    first = s.iloc[0]
-    if first == 0:
-        return s * 0.0
-    return s / first * 100.0
-
-
-# ----------------------------------------------------------------------
-# 5. Rischio, Sharpe, VaR semplici
-# ----------------------------------------------------------------------
-
-def compute_risk_metrics(nav_series: pd.Series,
-                         bench_series: pd.Series):
-    """
-    Calcola alcune metriche di rischio base.
-    nav_series e bench_series sono serie base 100 (float).
-    """
-
-    out = {
-        "volatility_ann_pct": None,
-        "sharpe_12m": None,
-        "var_1d_pct": None,
-        "tracking_error_ann_pct": None,
-    }
-
-    # rendimenti giornalieri %
-    rets = nav_series.pct_change().dropna()
-    if len(rets) > 2:
-        # volatilità ann (std giornaliera * sqrt(252))
-        vol_ann = float(rets.std() * math.sqrt(252))  # es. 0.15 = 15%
-        out["volatility_ann_pct"] = vol_ann * 100.0
-
-        # VaR 1-day 95% (quantile 5%)
-        var_1d = float(np.percentile(rets, 5))
-        out["var_1d_pct"] = var_1d * 100.0
-
-    # Sharpe 12m (molto semplificato):
-    # - calcoliamo rendimento medio giornaliero *252 / vol_ann
-    # - risk-free: fallback 4% annuo (0.04)
-    if len(rets) > 10:
-        avg_daily = float(rets.mean())
-        rf_ann = 0.04  # fallback default
-        rf_daily = (1.0 + rf_ann) ** (1.0/252.0) - 1.0
-        excess_daily = avg_daily - rf_daily
-        vol_daily = float(rets.std())
-        if vol_daily > 0:
-            sharpe = (excess_daily * 252.0) / (vol_daily * math.sqrt(252.0))
-            out["sharpe_12m"] = sharpe
-
-    # Tracking error: std dei residui vs benchmark
-    if bench_series is not None and not bench_series.dropna().empty:
-        bench_rets = bench_series.pct_change().dropna()
-        # allinea gli indici
-        comb = pd.concat([rets, bench_rets], axis=1).dropna()
-        comb.columns = ["p", "b"]
-        if len(comb) > 2:
-            diff = comb["p"] - comb["b"]
-            te_ann = float(diff.std() * math.sqrt(252))
-            out["tracking_error_ann_pct"] = te_ann * 100.0
-
-    return out
-
-
-# ----------------------------------------------------------------------
-# 6. PME / IRR placeholder
-# ----------------------------------------------------------------------
-
-def compute_pme_metrics(nav_series: pd.Series,
-                        bench_series: pd.Series):
-    """
-    Placeholder PME/IRR.
-    Nel tuo codice originale probabilmente calcoli IRR del portafoglio,
-    PME (Public Market Equivalent), ecc.
-    Qui ritorno qualche stub coerente per non rompere il JSON.
-
-    Sostituisci liberamente con la tua funzione reale.
-    """
-    out = {
-        "irr_portfolio": None,
-        "irr_benchmark": None,
-        "pme_ratio": None,
-    }
-
-    # Se hai già funzioni tipo calc_irr(...) nel tuo codice originale,
-    # puoi chiamarle qui usando i flussi di cassa reali.
-
-    return out
-
-
-# ----------------------------------------------------------------------
-# 7. Allocazioni (settori / paesi) placeholder
-# ----------------------------------------------------------------------
-
-def compute_allocations(lots_df: pd.DataFrame):
-    """
-    Qui potresti calcolare allocazioni per settore / paese se hai
-    già un mapping ticker -> breakdown.
-    Per ora restituisco strutture vuote ma consistenti.
-    """
-    return {
-        "portfolio_sectors": [],
-        "portfolio_countries": [],
-    }
-
-
-# ----------------------------------------------------------------------
-# 8. Funzione principale chiamata dal server
-# ----------------------------------------------------------------------
+###############################################################################
+# Funzione principale di analisi
+###############################################################################
 
 def analyze_portfolio_from_text(lots_text: str,
                                 bench: str,
@@ -330,10 +360,10 @@ def analyze_portfolio_from_text(lots_text: str,
     - parse lotti
     - scarica prezzi robusti per TUTTI i ticker + benchmark
     - costruisce NAV portafoglio, TWR base 100
-    - costruisce benchmark base 100 (con fallback)
+    - costruisce benchmark base 100 (con fallback benchmark->PORTFOLIO)
     - calcola Sharpe, VaR, PME, IRR
-    - salva grafico
-    - ritorna dict API-friendly
+    - salva grafico cumulato
+    - ritorna dict pronto per l'API
     """
 
     os.makedirs(outdir, exist_ok=True)
@@ -350,7 +380,6 @@ def analyze_portfolio_from_text(lots_text: str,
     for sym in all_tickers:
         s = robust_fetch_prices_for_symbol(sym, first_tx_date, start_buffer_days)
         if s is not None and not s.empty:
-            # s è una Series con index datetime e valori Close
             price_series[sym] = s.astype(float)
         time.sleep(0.05)
 
@@ -369,18 +398,22 @@ def analyze_portfolio_from_text(lots_text: str,
     if bench not in price_series or price_series[bench].empty:
         benchmark_is_fallback = True
 
-    # controllo duro: se non ho nemmeno un ticker con dati -> errore esplicito leggibile
+    # controllo duro: se non ho nemmeno un ticker con dati
     if len(price_series) == 0:
         raise RuntimeError(
-            f"Nessun dato prezzi scaricato da Yahoo Finance. Tickers richiesti: {all_tickers}"
+            f"Nessun dato prezzi scaricato da Yahoo Finance. "
+            f"Tickers richiesti: {all_tickers}"
         )
 
     # 3. costruisci dataframe prezzi
-    #    (solo serie effettivamente presenti, e tutte castate a float)
-    px_list = [ser for ser in price_series.values() if ser is not None and not ser.empty]
+    px_list = [
+        ser for ser in price_series.values()
+        if ser is not None and not ser.empty
+    ]
     if len(px_list) == 0:
         raise RuntimeError(
-            f"Nessuna serie valida dopo il download. Tickers richiesti: {all_tickers}"
+            f"Nessuna serie valida dopo il download. "
+            f"Tickers richiesti: {all_tickers}"
         )
 
     px = pd.concat(px_list, axis=1).sort_index().ffill()
@@ -389,10 +422,8 @@ def analyze_portfolio_from_text(lots_text: str,
     # filtra date dalla prima operazione
     px = px.loc[px.index >= (first_tx_date - timedelta(days=start_buffer_days))]
 
-    # 4. se il benchmark era mancante, fallback al portafoglio stesso
+    # 4. Se il benchmark era mancante, lo sostituiremo col portafoglio più avanti
     if benchmark_is_fallback:
-        # NOTE: non abbiamo ancora calcolato port_val, quindi per ora segnamo
-        # che useremo portafoglio come bench dopo aver calcolato port_val.
         bench_fallback_flag = True
     else:
         bench_fallback_flag = False
@@ -407,24 +438,24 @@ def analyze_portfolio_from_text(lots_text: str,
         d = r["data"]
         qty = float(r["quantità"])
         px_file = float(r["prezzo"])
-        # allinea la data di acquisto alla prima data di mercato >= d
-        # se la data d non esiste nell'indice px, mappiamo alla successiva disponibile
+
+        # trova la prima data di mercato >= d
         pos = px.index.searchsorted(d, side="left")
         if pos >= len(px.index):
-            # nessuna data di mercato >= d -> ignoriamo questa trade perché fuori range
+            # se non c'è nessuna data >= d (dopo tutti i filtri), saltiamo questa operazione
             continue
         d_eff = px.index[pos]
 
         trades.append((sym, d, d_eff, qty, px_file))
 
         if sym in shares.columns:
-            # aggiungiamo la quantità a partire da d_eff in avanti
+            # aggiungi quantità da d_eff in avanti
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
     # 6. valore portafoglio giornaliero
     port_val = (shares * px[present]).sum(axis=1)
 
-    # tieni solo da quando il portafoglio ha valore > 0
+    # tieni solo da quando il NAV è >0
     first_mv_mask = port_val > 0
     if not first_mv_mask.any():
         raise RuntimeError("Portafoglio senza valore positivo (controlla i lotti).")
@@ -438,24 +469,22 @@ def analyze_portfolio_from_text(lots_text: str,
         bench_name = "PORTFOLIO"
     else:
         if bench not in px.columns:
-            # se siamo qui bench non è fallback ma non è in px? edge case
-            # => usiamo fallback comunque
+            # edge case: bench dichiarato non fallback ma non presente in px
             bench_val_raw = port_val.copy()
             bench_name = "PORTFOLIO"
         else:
             bench_val_raw = px[bench].dropna()
             bench_name = bench
 
-    # allinea su intersezione date
+    # allinea sulle stesse date
     idx_common = port_val.index.intersection(bench_val_raw.index)
     port_val = port_val.loc[idx_common]
     bench_val = bench_val_raw.loc[idx_common]
 
-    # controllo duro: se dopo l'allineamento non resta nulla -> errore chiaro
     if len(port_val) == 0 or len(bench_val) == 0:
         raise RuntimeError("Serie portafoglio/benchmark vuote dopo allineamento date.")
 
-    # 8. cash flow giornaliero (positivo = contribuzione)
+    # 8. cash flow giornaliero
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file in trades:
         if d_eff in cf.index:
@@ -482,10 +511,10 @@ def analyze_portfolio_from_text(lots_text: str,
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
 
-    # 11. risk-free daily
+    # 11. risk-free giornaliero
     rf_daily, rf_meta = build_rf_daily_series_web(twr_ret.index)
 
-    # 12. PME (replica cash flow sul benchmark)
+    # 12. PME (replico i cashflow sul benchmark)
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -502,12 +531,16 @@ def analyze_portfolio_from_text(lots_text: str,
     port_r_12m = (twr_ret.iloc[-lb:] if len(twr_ret) >= lb else twr_ret.dropna()).copy()
     rf_12m = rf_daily.reindex(port_r_12m.index).ffill().fillna(0.0)
 
-    vol_port_12m = np.nan if port_r_12m.empty else float(port_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
+    vol_port_12m = np.nan if port_r_12m.empty else float(
+        port_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS)
+    )
 
     sharpe_port_12m = np.nan
     if (not port_r_12m.empty) and (port_r_12m.std(ddof=1) > 0):
         ex = port_r_12m - rf_12m
-        sharpe_port_12m = float(np.sqrt(TRADING_DAYS) * ex.mean() / ex.std(ddof=1))
+        sharpe_port_12m = float(
+            np.sqrt(TRADING_DAYS) * ex.mean() / ex.std(ddof=1)
+        )
 
     z_95 = 1.65
     sigma_1d = float(port_r_12m.std(ddof=1)) if not port_r_12m.empty else np.nan
@@ -518,12 +551,16 @@ def analyze_portfolio_from_text(lots_text: str,
     bench_r_12m = (bench_ret.iloc[-lb:] if len(bench_ret) >= lb else bench_ret.dropna()).copy()
     rf_12m_b = rf_daily.reindex(bench_r_12m.index).ffill().fillna(0.0)
 
-    vol_bench_12m = np.nan if bench_r_12m.empty else float(bench_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
+    vol_bench_12m = np.nan if bench_r_12m.empty else float(
+        bench_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS)
+    )
 
     sharpe_bench_12m = np.nan
     if (not bench_r_12m.empty) and (bench_r_12m.std(ddof=1) > 0):
         exb = bench_r_12m - rf_12m_b
-        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))
+        sharpe_bench_12m = float(
+            np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1)
+        )
 
     sigma_1d_b = float(bench_r_12m.std(ddof=1)) if not bench_r_12m.empty else np.nan
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
@@ -532,7 +569,7 @@ def analyze_portfolio_from_text(lots_text: str,
 
     # 14. summary IRR / PME
     contrib = cf.clip(upper=0) * -1.0   # soldi entrati (acquisti)
-    withdrw = cf.clip(lower=0)          # soldi usciti (vendite)
+    withdrw = cf.clip(lower=0)          # soldi usciti (vendite positive)
     gross_contrib = float(contrib.sum())
     gross_withdrw = float(withdrw.sum())
     net_invested = float(cf.sum())
@@ -540,13 +577,18 @@ def analyze_portfolio_from_text(lots_text: str,
     current_value_port_val = current_value_port
     current_value_pme = float(bench_pme_val.iloc[-1])
 
-    r_net_port = (current_value_port_val / net_invested - 1) if net_invested > 0 else np.nan
-    r_net_bench = (current_value_pme / net_invested - 1) if net_invested > 0 else np.nan
-    r_net_excess = (
-        r_net_port - r_net_bench
-        if (np.isfinite(r_net_port) and np.isfinite(r_net_bench))
-        else np.nan
+    r_net_port = (
+        (current_value_port_val / net_invested - 1)
+        if net_invested > 0 else np.nan
     )
+    r_net_bench = (
+        (current_value_pme / net_invested - 1)
+        if net_invested > 0 else np.nan
+    )
+    if (np.isfinite(r_net_port) and np.isfinite(r_net_bench)):
+        r_net_excess = r_net_port - r_net_bench
+    else:
+        r_net_excess = np.nan
 
     cf_list = [
         (t, -float(cf.loc[t]))
@@ -564,11 +606,10 @@ def analyze_portfolio_from_text(lots_text: str,
 
     irr_port = xirr(cf_port)
     irr_bench = xirr(cf_bench)
-    irr_excess = (
-        irr_port - irr_bench
-        if (np.isfinite(irr_port) and np.isfinite(irr_bench))
-        else np.nan
-    )
+    if (np.isfinite(irr_port) and np.isfinite(irr_bench)):
+        irr_excess = irr_port - irr_bench
+    else:
+        irr_excess = np.nan
 
     # 15. grafico cumulato
     plot_path = os.path.join(outdir, "crescita_cumulata.png")
@@ -593,11 +634,15 @@ def analyze_portfolio_from_text(lots_text: str,
 
     bench_sectors, bench_countries = get_etf_allocations(bench_name)
     if not bench_sectors.empty:
-        bench_sectors = bench_sectors.rename(columns={"weight":"weight_portfolio"}).copy()
+        bench_sectors = bench_sectors.rename(
+            columns={"weight":"weight_portfolio"}
+        ).copy()
     else:
         bench_sectors = pd.DataFrame(columns=["label","weight_portfolio"])
     if not bench_countries.empty:
-        bench_countries = bench_countries.rename(columns={"weight":"weight_portfolio"}).copy()
+        bench_countries = bench_countries.rename(
+            columns={"weight":"weight_portfolio"}
+        ).copy()
     else:
         bench_countries = pd.DataFrame(columns=["label","weight_portfolio"])
 
@@ -620,12 +665,16 @@ def analyze_portfolio_from_text(lots_text: str,
         ("Current Value – Bench (PME)", money(current_value_pme)),
         ("Volatility 12m (ann.) – Portfolio", fmt_pct(vol_port_12m)),
         ("Volatility 12m (ann.) – Benchmark", fmt_pct(vol_bench_12m)),
-        (f"Sharpe 12m – Portfolio [{rf_meta}]", f"{sharpe_port_12m:.2f}" if np.isfinite(sharpe_port_12m) else "n/a"),
-        (f"Sharpe 12m – Benchmark [{rf_meta}]", f"{sharpe_bench_12m:.2f}" if np.isfinite(sharpe_bench_12m) else "n/a"),
+        (f"Sharpe 12m – Portfolio [{rf_meta}]",
+         f"{sharpe_port_12m:.2f}" if np.isfinite(sharpe_port_12m) else "n/a"),
+        (f"Sharpe 12m – Benchmark [{rf_meta}]",
+         f"{sharpe_bench_12m:.2f}" if np.isfinite(sharpe_bench_12m) else "n/a"),
         ("1D VaR(95%) – Portfolio (pct)", fmt_pct(var95_pct)),
-        ("1D VaR(95%) – Portfolio (USD)", money(var95_usd) if np.isfinite(var95_usd) else "n/a"),
+        ("1D VaR(95%) – Portfolio (USD)",
+         money(var95_usd) if np.isfinite(var95_usd) else "n/a"),
         ("1D VaR(95%) – Benchmark (pct)", fmt_pct(var95_bench_pct)),
-        ("1D VaR(95%) – Benchmark (USD)", money(var95_bench_usd) if np.isfinite(var95_bench_usd) else "n/a"),
+        ("1D VaR(95%) – Benchmark (USD)",
+         money(var95_bench_usd) if np.isfinite(var95_bench_usd) else "n/a"),
     ]
     for k, v in rows_out:
         summary_lines.append(f"{k.ljust(45)} {v}")
@@ -635,7 +684,7 @@ def analyze_portfolio_from_text(lots_text: str,
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
-    # 19. ritorno finale
+    # 19. ritorno finale per l'API
     out = {
         "summary_lines": summary_lines,
         "plot_path": plot_path,
