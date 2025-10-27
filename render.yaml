@@ -1,9 +1,10 @@
 services:
   - type: web
     name: portfolio-analyzer
-    runtime: docker
+    env: python
     plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
     envVars:
       - key: FRED_API_KEY
-        value: ""   # opzionale: metti qui la tua API key FRED se vuoi Sharpe con RF reale
-    autoDeploy: true
+        value: ""
