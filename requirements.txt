@@ -6,4 +6,3 @@ yfinance==0.2.43
 pandas-datareader==0.10.0
 requests==2.32.3
 beautifulsoup4==4.12.3
-playwright==1.47.2
