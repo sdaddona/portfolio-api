@@ -1,17 +1,20 @@
 import os
-import io
 import re
 import time
+from datetime import datetime, timedelta
+
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import yfinance as yf
-from pandas_datareader import data as pdr
-from datetime import datetime, timedelta
+from pandas_datareader import data as pdr  # FRED
 
 TRADING_DAYS = 252
+
+
+# ---------------- Utils ----------------
 
 def to_naive(obj):
     if isinstance(obj, (pd.Series, pd.DataFrame)) and isinstance(obj.index, pd.DatetimeIndex):
@@ -24,6 +27,9 @@ def to_naive(obj):
 def to_date(s: str) -> pd.Timestamp:
     s = str(s).strip()
     dt = pd.to_datetime(s, errors="coerce")
+    if pd.isna(dt):
+        # tentativo dayfirst (eventuale)
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if pd.isna(dt):
         raise ValueError(f"Data non riconosciuta: {s}")
     try:
@@ -60,10 +66,19 @@ def xirr(cf):
             lo = mid
     return mid
 
+
+# ---------------- Input lots ----------------
+
 def read_lots_from_text(txt: str) -> pd.DataFrame:
+    """
+    Accetta righe tipo:
+      TICKER YYYY-MM-DD QTY PRICE
+    separatori: spazi multipli / tab / virgole / ';'
+    """
     lines = [ln for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     if not lines:
         raise ValueError("Nessuna riga valida nei lotti.")
+
     rows = []
     for ln in lines:
         parts = re.split(r"[,\t;]+|\s+", ln.strip())
@@ -72,13 +87,17 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
         ticker = parts[0].strip().upper()
         data = to_date(parts[1])
         try:
-            qty = float(str(parts[2]).replace(",", "."))
-            px = float(str(parts[3]).replace(",", "."))
+            qty = float(str(parts[2]).replace(" ", "").replace(",", "."))
+            px  = float(str(parts[3]).replace(" ", "").replace(",", "."))
         except Exception:
-            raise ValueError(f"Prezzo o quantità non valido: '{ln}'")
+            raise ValueError(f"Quantità o prezzo non valido: '{ln}'")
         rows.append((ticker, data, qty, px))
+
     df = pd.DataFrame(rows, columns=["ticker", "data", "quantità", "prezzo"])
     return df.sort_values("data").reset_index(drop=True)
+
+
+# ---------------- Risk-free ----------------
 
 def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04):
     rf_source = (rf_source or "fred_1y").lower()
@@ -89,6 +108,7 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
         return rf_daily, rf_meta
 
     if rf_source == "irx_13w":
+        # 13-week T-Bill (^IRX)
         try:
             h = yf.Ticker("^IRX").history(start=index[0]-pd.Timedelta(days=10),
                                           end=index[-1]+pd.Timedelta(days=3),
@@ -98,12 +118,13 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
             rf_daily = rf_annual / TRADING_DAYS
             return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
         except Exception:
-            rf_daily = pd.Series(rf / TRADING_DAYS, index=index)
-            return rf_daily, "RF fallback (IRX failed)"
+            pass  # fallback sotto
 
     # default: FRED DGS1
     try:
-        fred = pdr.DataReader("DGS1", "fred", index[0]-pd.Timedelta(days=10), index[-1]+pd.Timedelta(days=3))
+        fred = pdr.DataReader("DGS1", "fred",
+                              index[0]-pd.Timedelta(days=10),
+                              index[-1]+pd.Timedelta(days=3))
         ser = fred["DGS1"].rename("DGS1").sort_index()
         ser = ser.reindex(index).ffill()
         rf_annual = ser / 100.0
@@ -113,35 +134,47 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
         rf_daily = pd.Series(rf / TRADING_DAYS, index=index)
         return rf_daily, "RF fallback (FRED failed)"
 
-def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs",
-                                start_buffer_days=7, use_adjclose=False,
-                                rf_source="fred_1y", rf=0.04):
+
+# ---------------- Core analysis ----------------
+
+def analyze_portfolio_from_text(
+    lots_text: str,
+    bench: str,
+    outdir: str = "/tmp/outputs",
+    start_buffer_days: int = 7,
+    use_adjclose: bool = False,
+    rf_source: str = "fred_1y",
+    rf: float = 0.04,
+):
     os.makedirs(outdir, exist_ok=True)
+
     lots = read_lots_from_text(lots_text)
     first_tx_date = lots["data"].min()
     bench = bench.upper()
 
+    # Risoluzione "soft" dei ticker su Yahoo (prova suffissi comuni)
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
     resolved = {}
     for s in tickers:
+        ok = None
         for t in [s, f"{s}.US", f"{s}.L", f"{s}.MI"]:
             try:
                 h = yf.Ticker(t).history(period="10d")
                 if isinstance(h, pd.DataFrame) and not h.empty:
-                    resolved[s] = t
+                    ok = t
                     break
             except Exception:
                 pass
-        if s not in resolved:
-            resolved[s] = s
+        resolved[s] = ok or s
 
+    # Prezzi
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
     series = {}
-    for k, y in resolved.items():
+    for k, ysym in resolved.items():
         try:
-            h = yf.Ticker(y).history(start=start, end=end, interval="1d",
-                                     auto_adjust=use_adjclose)
+            h = yf.Ticker(ysym).history(start=start, end=end, interval="1d",
+                                        auto_adjust=use_adjclose)
             if h is None or h.empty or "Close" not in h.columns:
                 continue
             s = h["Close"].rename(k).sort_index().ffill()
@@ -155,6 +188,7 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     px = pd.concat(series.values(), axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
 
+    # Calendario, trades e posizioni (shares)
     calendar = px.index
     trades = []
     for _, r in lots.iterrows():
@@ -162,10 +196,12 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
         d = r["data"]
         qty = float(r["quantità"])
         px_file = float(r["prezzo"])
-        d_eff = calendar.searchsorted(d, side="left")
-        if d_eff >= len(calendar):
+        # mappa alla prima data >= trade date
+        pos = calendar.searchsorted(d, side="left")
+        if pos >= len(calendar):
             continue
-        d_eff = calendar[d_eff]
+        d_eff = calendar[pos]
+        # se use_adjclose True, usiamo prezzo storico (AdjClose); altrimenti prezzo del file nel giorno d_eff
         px_eff_trade = float(px.loc[d_eff, sym]) if use_adjclose else px_file
         trades.append((sym, d, d_eff, qty, px_file, px_eff_trade))
 
@@ -187,11 +223,13 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     port_val = port_val.loc[idx_common]
     bench_val = bench_val.loc[idx_common]
 
+    # Cash flows (positivo = acquisti)
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if d_eff in cf.index:
             cf.loc[d_eff] += qty * px_eff_trade
 
+    # TWR base 100
     twr_ret = []
     dates = port_val.index
     for i in range(1, len(dates)):
@@ -207,8 +245,10 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
 
+    # RF
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
+    # PME (replica dei flussi sul benchmark)
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -219,6 +259,7 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
         bench_pme_val.append(units * px_b)
     bench_pme_val = pd.Series(bench_pme_val, index=port_val.index)
 
+    # Rischio 12m + VaR
     lb = TRADING_DAYS
     port_r_12m = (twr_ret.iloc[-lb:] if len(twr_ret) >= lb else twr_ret)
     rf_12m = rf_daily.reindex(port_r_12m.index).ffill().fillna(0.0)
@@ -239,12 +280,13 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     sharpe_bench_12m = np.nan
     if not bench_r_12m.empty and bench_r_12m.std(ddof=1) > 0:
         exb = bench_r_12m - rf_12m_b
-        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))
+        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / ex.std(ddof=1))
     sigma_1d_b = float(bench_r_12m.std(ddof=1)) if not bench_r_12m.empty else np.nan
-    var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     current_value_bench_pme = float(bench_pme_val.iloc[-1])
+    var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
+    # Metriche “net invested”
     contrib = cf.clip(upper=0) * -1.0
     withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
@@ -256,6 +298,7 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     r_net_bench = (current_value_pme / net_invested - 1) if net_invested > 0 else np.nan
     r_net_excess = r_net_port - r_net_bench if (np.isfinite(r_net_port) and np.isfinite(r_net_bench)) else np.nan
 
+    # IRR
     cf_list = [(t, -float(cf.loc[t])) for t in port_val.index if abs(float(cf.loc[t])) != 0.0]
     cf_port = sorted(cf_list + [(port_val.index[-1], current_value_port)], key=lambda x: x[0])
     cf_bench = sorted(cf_list + [(port_val.index[-1], current_value_pme)], key=lambda x: x[0])
@@ -263,11 +306,12 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     irr_bench = xirr(cf_bench)
     irr_excess = (irr_port - irr_bench) if (np.isfinite(irr_port) and np.isfinite(irr_bench)) else np.nan
 
+    # Grafico
     plot_path = os.path.join(outdir, "crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
     plt.plot(port_idx, label="Portafoglio (TWR, base 100)")
     plt.plot(bench_idx, label=f"Benchmark {bench} (base 100)")
-    mode_label = "AdjClose" if use_adjclose else "Close (usa prezzo file al trade day)"
+    mode_label = "AdjClose (ignora prezzo file)" if use_adjclose else "Close (usa prezzo file al trade day)"
     plt.title(f"Andamento storico (base 100)\nMode: {mode_label} | {rf_meta}")
     plt.ylabel("Indice (base 100)")
     plt.grid(True)
@@ -276,9 +320,10 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
     plt.savefig(plot_path, dpi=150)
     plt.close()
 
+    # Summary
     summary_lines = []
     summary_lines.append("=== SUMMARY (Benchmark PME-consistent) ===")
-    rows = [
+    for k, v in [
         ("Start Date", str(port_val.index[0].date())),
         ("End Date", str(port_val.index[-1].date())),
         ("Return (Net Invested) – Portfolio", fmt_pct(r_net_port)),
@@ -300,13 +345,20 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
         ("1D VaR(95%) – Portfolio (USD)", money(var95_usd) if np.isfinite(var95_usd) else "n/a"),
         ("1D VaR(95%) – Benchmark (pct)", fmt_pct(var95_bench_pct)),
         ("1D VaR(95%) – Benchmark (USD)", money(var95_bench_usd) if np.isfinite(var95_bench_usd) else "n/a"),
-    ]
-    for k, v in rows:
+    ]:
         summary_lines.append(f"{k.ljust(45)} {v}")
 
     sum_path = os.path.join(outdir, "summary.txt")
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
+
+    # Allocazioni (placeholder vuoti su Render)
+    alloc = {
+        "portfolio_sectors": [],
+        "portfolio_countries": [],
+        "bench_sectors": [],
+        "bench_countries": [],
+    }
 
     return {
         "summary_lines": summary_lines,
@@ -315,3 +367,23 @@ def analyze_portfolio_from_text(lots_text: str, bench: str, outdir="/tmp/outputs
         "risk": {
             "vol_port_12m": vol_port_12m,
             "vol_bench_12m": vol_bench_12m,
+            "sharpe_port_12m": sharpe_port_12m,
+            "sharpe_bench_12m": sharpe_bench_12m,
+            "var95_pct": var95_pct,
+            "var95_usd": var95_usd,
+            "var95_bench_pct": var95_bench_pct,
+            "var95_bench_usd": var95_bench_usd,
+        },
+        "pme": {
+            "r_net_port": r_net_port,
+            "r_net_bench": r_net_bench,
+            "r_net_excess": r_net_excess,
+            "irr_port": irr_port,
+            "irr_bench": irr_bench,
+            "irr_excess": irr_excess,
+            "current_value_port": current_value_port,
+            "current_value_pme": current_value_pme,
+            "net_invested": net_invested,
+        },
+        "alloc": alloc,
+    }
