@@ -11,7 +11,6 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("portfolio-api")
 
-# CORS (puoi restringere a "https://www.daddona.it" quando sei pronto)
 ALLOWED_ORIGINS = "*"
 
 def add_cors_headers(resp):
@@ -43,47 +42,35 @@ def analyze():
     try:
         data = request.get_json(silent=True)
         if data is None:
-            resp = jsonify({"ok": False, "error": "Body JSON mancante o non valido"})
-            return add_cors_headers(resp), 400
+            return add_cors_headers(jsonify({"ok": False, "error": "Body JSON mancante o non valido"})), 400
 
-        lots_text   = (data.get("lots_text") or "").strip()
-        bench       = (data.get("bench") or "").strip()
-        # —— nuovi parametri per replicare il locale ——
-        use_adjclose = bool(data.get("use_adjclose", False))   # locale: False
-        rf_source    = (data.get("rf_source") or "fred_1y").strip().lower()
-        rf_fixed     = float(data.get("rf_fixed", 0.04))
+        lots_text   = data.get("lots_text", "")
+        bench       = data.get("bench", "")
+        use_adjclose = bool(data.get("use_adjclose", False))
+        rf_source    = str(data.get("rf_source", "fred_1y"))
+        rf           = float(data.get("rf", 0.04))
 
-        if not lots_text:
-            resp = jsonify({"ok": False, "error": "lots_text mancante"})
-            return add_cors_headers(resp), 400
-        if not bench:
-            resp = jsonify({"ok": False, "error": "bench mancante"})
-            return add_cors_headers(resp), 400
+        if not lots_text.strip():
+            return add_cors_headers(jsonify({"ok": False, "error": "lots_text mancante"})), 400
+        if not bench.strip():
+            return add_cors_headers(jsonify({"ok": False, "error": "bench mancante"})), 400
 
-        logger.info(
-            "Analyze called | bench=%s | use_adjclose=%s | rf_source=%s | rf_fixed=%s | chars(lots)=%d",
-            bench, use_adjclose, rf_source, rf_fixed, len(lots_text)
-        )
+        logger.info(f"Analyze called | bench={bench} | use_adjclose={use_adjclose} | rf_source={rf_source} | rf={rf} | chars(lots)={len(lots_text)}")
 
         result = run_full_analysis(
             lots_text=lots_text,
             bench=bench,
             use_adjclose=use_adjclose,
             rf_source=rf_source,
-            rf_fixed=rf_fixed,
+            rf=rf,
         )
 
-        out = {"ok": True, **result}
-        resp = jsonify(out)
+        resp = jsonify({"ok": True, **result})
         return add_cors_headers(resp), 200
 
     except Exception as e:
-        logger.exception("Errore in /analyze")
-        resp = jsonify({
-            "ok": False,
-            "error": str(e),
-            "trace": traceback.format_exc()
-        })
+        logger.error("Errore in /analyze")
+        resp = jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()})
         return add_cors_headers(resp), 500
 
 @app.route("/plot", methods=["GET", "OPTIONS"])
@@ -91,23 +78,15 @@ def get_plot():
     if request.method == "OPTIONS":
         resp = make_response("", 204)
         return add_cors_headers(resp)
-
     try:
         plot_path = "/tmp/outputs/crescita_cumulata.png"
         if not os.path.exists(plot_path):
-            resp = jsonify({"ok": False, "error": "Plot non disponibile. Esegui prima /analyze."})
-            return add_cors_headers(resp), 404
-
+            return add_cors_headers(jsonify({"ok": False, "error": "Plot non disponibile. Esegui prima /analyze."})), 404
         resp = send_file(plot_path, mimetype="image/png", as_attachment=False)
         return add_cors_headers(resp), 200
-
     except Exception as e:
         logger.exception("Errore in /plot")
-        resp = jsonify({
-            "ok": False,
-            "error": str(e),
-            "trace": traceback.format_exc()
-        })
+        resp = jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()})
         return add_cors_headers(resp), 500
 
 if __name__ == "__main__":
