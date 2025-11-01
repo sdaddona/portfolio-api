@@ -86,36 +86,88 @@ def map_to_effective_date(d: pd.Timestamp, idx: pd.DatetimeIndex) -> pd.Timestam
 
 
 ###############################################################################
-# Lettura lotti dalla textarea
+# Lettura lotti dalla textarea (versione robusta)
 ###############################################################################
+
+# --- parsing numeri "sporchi" (tab, NBSP, migliaia, virgola decimale, ecc.)
+NBSP = u"\u00A0"
+
+def _clean_num(token: str) -> float:
+    """
+    Converte stringhe 'sporche' in float.
+    - Rimuove tutto tranne cifre, segno, virgola e punto
+    - Gestisce separatore migliaia e virgola decimale
+    - Accetta quantità negative
+    """
+    if token is None:
+        raise ValueError("numero mancante")
+    s = str(token).strip().replace(NBSP, " ")
+    # tieni solo caratteri utili: cifre, segno, virgola, punto
+    s = re.sub(r"[^0-9\-\+\,\.]", "", s)
+    # se ci sono sia virgole che punti → considera la virgola separatore migliaia
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
+    if s in ("", "+", "-"):
+        raise ValueError(f"numero vuoto: {token!r}")
+    return float(s)
 
 def read_lots_from_text(txt: str) -> pd.DataFrame:
     """
-    Formato atteso:
-    TICKER DATA QUANTITA PREZZO
-    Esempio:
-    VT 2024-01-02 10 100
-    VT 2024-03-10 5 95
+    Accetta righe con qualsiasi combinazione di spazi, tab, virgole o ';' come separatori.
+
+    Formato:  TICKER  DATA(YYYY-MM-DD)  QUANTITA  PREZZO
+    Esempi:
+      ACWI 2012-12-21 200 47.81
+      EEM  2012-12-21 235 43,2348
+      ACWV 2025-09-23 -270 119.5
+      DWM  2025-10-01 -190 66,43
     """
-    lines = []
-    for ln in txt.splitlines():
-        ln_strip = ln.strip()
-        if not ln_strip or ln_strip.startswith("#"):
-            continue
-        lines.append(ln_strip)
-    if not lines:
+    if not isinstance(txt, str) or not txt.strip():
         raise ValueError("Nessuna riga valida nei lotti.")
 
     rows = []
-    for ln in lines:
-        parts = re.split(r"[,\t;]+|\s+", ln.strip())
+    for raw in txt.splitlines():
+        line = (raw or "").strip().replace(NBSP, " ")
+        if not line or line.startswith("#"):
+            continue
+
+        # split permissivo: spazi, tab, virgole o ';'
+        parts = re.split(r"[,\t;]+|\s+", line)
         if len(parts) < 4:
-            raise ValueError(f"Riga lotti invalida: {ln}")
+            # prova a comprimere spazi multipli e rifare split
+            line2 = re.sub(r"\s+", " ", line)
+            parts = re.split(r"[,\t;]+|\s+", line2)
+
+        if len(parts) < 4:
+            raise ValueError(f"Riga lotti invalida: {raw!r}")
+
         ticker = parts[0].strip().upper()
-        data = to_date(parts[1])
-        qty = float(str(parts[2]).replace(",", "."))
-        px = float(str(parts[3]).replace(",", "."))
-        rows.append((ticker, data, qty, px))
+
+        # parsing data robusto (YYYY-MM-DD o day-first)
+        try:
+            dt = to_date(parts[1])
+        except Exception:
+            dt = pd.to_datetime(parts[1], errors="coerce", dayfirst=True)
+            if pd.isna(dt):
+                raise ValueError(f"Data non riconosciuta: {parts[1]!r} (riga: {raw!r})")
+            dt = pd.to_datetime(dt).tz_localize(None)
+
+        try:
+            qty = _clean_num(parts[2])
+        except Exception as e:
+            raise ValueError(f"Quantità non valida: {parts[2]!r} (riga: {raw!r})") from e
+
+        try:
+            px = _clean_num(parts[3])
+        except Exception as e:
+            raise ValueError(f"Prezzo non valido: {parts[3]!r} (riga: {raw!r})") from e
+
+        rows.append((ticker, dt, float(qty), float(px)))
+
+    if not rows:
+        raise ValueError("Nessuna riga valida nei lotti.")
 
     df = pd.DataFrame(rows, columns=["ticker", "data", "quantità", "prezzo"])
     df = df.sort_values("data").reset_index(drop=True)
@@ -503,7 +555,7 @@ def analyze_portfolio_from_text(lots_text: str,
 
     # 5. cash flow giornaliero (positivo = contribuzione/acquisto)
     cf = pd.Series(0.0, index=port_val.index)
-    for sym, d0, d_eff, qty, px_file in trades:
+    for _, d0, d_eff, qty, px_file in trades:
         if d_eff in cf.index:
             cf.loc[d_eff] += qty * px_file
 
