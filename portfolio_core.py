@@ -4,19 +4,13 @@ from portfolio_analysis_web import analyze_portfolio_from_text
 def run_full_analysis(
     lots_text: str,
     bench: str,
-    *,
-    use_adjclose: bool = False,     # come il tuo locale
-    rf_source: str = "fred_1y",     # come il tuo locale
-    rf_fixed: float = 0.04          # usato solo se rf_source == "fixed"
+    use_adjclose: bool = False,
+    rf_source: str = "fred_1y",
+    rf: float = 0.04,
 ):
     """
-    Bridge tra server e logica finanziaria.
-
-    lots_text: contenuto della textarea (ticker, data, qty, prezzo)
-    bench: ticker benchmark (es. 'VT')
-    use_adjclose: False = usa Close e sostituisce il prezzo del file nel trade day
-    rf_source: 'fred_1y' | 'irx_13w' | 'fixed'
-    rf_fixed: valore annuo (solo se rf_source='fixed')
+    Glue che chiama la logica finanziaria e restituisce
+    un dizionario JSON-safe per server.py.
     """
     outdir = "/tmp/outputs"
     os.makedirs(outdir, exist_ok=True)
@@ -27,6 +21,6 @@ def run_full_analysis(
         outdir=outdir,
         use_adjclose=use_adjclose,
         rf_source=rf_source,
-        rf=rf_fixed
+        rf=rf,
     )
     return analysis
