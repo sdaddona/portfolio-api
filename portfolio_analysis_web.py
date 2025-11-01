@@ -7,20 +7,18 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # render headless
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+import yfinance as yf
+from pandas_datareader import data as pdr  # FRED
 
 TRADING_DAYS = 252
 
-###############################################################################
-# CACHE IN-MEMORY PER PREZZI YAHOO
-###############################################################################
-_price_cache = {}  # dict[(ticker, start_ts, end_ts, kind)] = pandas.Series
+# =============================================================================
+# Utils
+# =============================================================================
 
-
-###############################################################################
-# UTILITY DI BASE
-###############################################################################
 def to_naive(obj):
     if isinstance(obj, (pd.Series, pd.DataFrame)) and isinstance(obj.index, pd.DatetimeIndex):
         try:
@@ -28,7 +26,6 @@ def to_naive(obj):
         except Exception:
             pass
     return obj
-
 
 def to_date(s: str) -> pd.Timestamp:
     s = str(s).strip()
@@ -42,24 +39,19 @@ def to_date(s: str) -> pd.Timestamp:
     except Exception:
         return dt
 
-
 def money(x: float) -> str:
     return f"{x:,.2f} USD"
-
 
 def fmt_pct(x):
     if x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x))):
         return "n/a"
     return f"{x:.2%}"
 
-
 def xnpv(r, cf):
     t0 = cf[0][0]
     return sum(a / (1 + r) ** ((t - t0).days / 365.25) for t, a in cf)
 
-
 def xirr(cf):
-    # cf: list of (date, amount)
     has_pos = any(a > 0 for _, a in cf)
     has_neg = any(a < 0 for _, a in cf)
     if not (has_pos and has_neg):
@@ -76,29 +68,20 @@ def xirr(cf):
             lo = mid
     return mid
 
-
 def map_to_effective_date(d: pd.Timestamp, idx: pd.DatetimeIndex) -> pd.Timestamp | None:
     pos = idx.searchsorted(d, side="left")
     if pos >= len(idx):
         return None
     return idx[pos]
 
-
-###############################################################################
-# PARSER ROBUSTO LOTTI (TAB, NBSP, VIRGOLE, CARATTERI INVISIBILI)
-###############################################################################
+# =============================================================================
+# Parser lotti (robusto per tab, spazi multipli, NBSP, ecc.)
+# =============================================================================
 NBSP = u"\u00A0"
 NARROW_NBSP = u"\u202F"
 ZERO_WIDTH = u"\u200B"
 
-
 def _clean_num(token: str) -> float:
-    """
-    Converte numeri 'sporchi' in float.
-    - Rimuove NBSP, narrow NBSP, zero-width e whitespace
-    - Accetta virgola o punto decimale
-    - Se presenti sia . che , assume ',' separatore migliaia
-    """
     if token is None:
         raise ValueError("numero mancante")
     s = str(token).strip()
@@ -113,14 +96,7 @@ def _clean_num(token: str) -> float:
         raise ValueError(f"numero vuoto: {token!r}")
     return float(s)
 
-
 def read_lots_from_text(txt: str) -> pd.DataFrame:
-    """
-    Formato logico per riga:  TICKER  DATA  QTY  PREZZO
-    - accetta spazi, TAB, virgole o ';' come separatori
-    - tollera caratteri invisibili/unicode
-    - dopo la data, prende i PRIMI DUE token 'numerici' come (qty, prezzo)
-    """
     if not isinstance(txt, str) or not txt.strip():
         raise ValueError("Nessuna riga valida nei lotti.")
 
@@ -129,17 +105,12 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
         line = (raw or "").strip()
         if not line or line.startswith("#"):
             continue
-
-        # normalizza unicode fastidiosi
         line = (line
                 .replace(NBSP, " ")
                 .replace(NARROW_NBSP, " ")
                 .replace(ZERO_WIDTH, ""))
-
-        # split permissivo
         parts = [p for p in re.split(r"[,\t;]+|\s+", line) if p != ""]
         if len(parts) < 4:
-            # fallback: comprimi whitespace e riprova
             line2 = re.sub(r"\s+", " ", line).strip()
             parts = [p for p in re.split(r"[,\t;]+|\s+", line2) if p != ""]
 
@@ -148,7 +119,7 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
 
         ticker = parts[0].strip().upper()
 
-        # data robusta
+        # data
         try:
             dt = to_date(parts[1])
         except Exception:
@@ -157,7 +128,7 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
                 raise ValueError(f"Data non riconosciuta: {parts[1]!r} (riga: {raw!r})")
             dt = pd.to_datetime(dt_try).tz_localize(None)
 
-        # quantità e prezzo: primi due token con almeno una cifra
+        # qty + prezzo = primi 2 token numerici
         tail = parts[2:]
         numeric_tokens = []
         for tok in tail:
@@ -165,7 +136,6 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
                 numeric_tokens.append(tok)
             if len(numeric_tokens) >= 2:
                 break
-
         if len(numeric_tokens) < 2:
             raise ValueError(f"Quantità/Prezzo mancanti o illeggibili (riga: {raw!r})")
 
@@ -178,182 +148,35 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
     df = df.sort_values("data").reset_index(drop=True)
     return df
 
-
-###############################################################################
-# RISK-FREE (FRED con fallback fisso 4%)
-###############################################################################
-def fetch_fred_series(series_id: str,
-                      start_date: pd.Timestamp,
-                      end_date: pd.Timestamp,
-                      api_key: str | None) -> pd.Series:
-    """
-    Scarica serie FRED (es. DGS1 = 1Y Treasury yield, % annuo).
-    Se fallisce -> Series vuota.
-    """
-    if api_key is None or api_key.strip() == "":
-        return pd.Series(dtype=float)
-
-    base_url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "observation_start": start_date.strftime("%Y-%m-%d"),
-        "observation_end": end_date.strftime("%Y-%m-%d"),
-    }
-
-    try:
-        r = requests.get(base_url, params=params, timeout=10)
-        if r.status_code != 200:
-            return pd.Series(dtype=float)
-        data = r.json().get("observations", [])
-    except Exception:
-        return pd.Series(dtype=float)
-
-    dates, vals = [], []
-    for obs in data:
-        dstr = obs.get("date")
-        vstr = obs.get("value")
-        if vstr in (None, ".", ""):
-            continue
-        try:
-            d = pd.to_datetime(dstr).tz_localize(None)
-            v = float(vstr)
-        except Exception:
-            continue
-        dates.append(d)
-        vals.append(v)
-
-    if not dates:
-        return pd.Series(dtype=float)
-
-    ser = pd.Series(vals, index=pd.DatetimeIndex(dates)).sort_index()
-    return ser
-
-
+# =============================================================================
+# Risk-free (FRED DGS1) con fallback
+# =============================================================================
 def build_rf_daily_series_web(index: pd.DatetimeIndex,
                               fallback_annual_rf: float = 0.04) -> tuple[pd.Series, str]:
-    """
-    Ritorna rf_daily (Series con rf giornaliero in frazione) e rf_meta (descrizione).
-    1) prova FRED DGS1 (1-Year Treasury Yield, % annuo)
-    2) se fallisce -> fallback fisso (es. 4% annuo)
-    """
     if len(index) == 0:
         return pd.Series(dtype=float), "RF: n/a"
 
-    api_key = os.getenv("FRED_API_KEY", "").strip()
     try:
-        start_fetch = index[0] - pd.Timedelta(days=10)
-        end_fetch   = index[-1] + pd.Timedelta(days=3)
-    except Exception:
-        return pd.Series(fallback_annual_rf / TRADING_DAYS, index=index), f"Fixed RF {fallback_annual_rf:.2%} (ann., fallback)"
-
-    dgs1 = fetch_fred_series("DGS1", start_fetch, end_fetch, api_key)
-    if not dgs1.empty:
-        dgs1 = dgs1.reindex(index).ffill()
-        rf_annual = dgs1 / 100.0
+        fred = pdr.DataReader("DGS1", "fred",
+                              index[0]-pd.Timedelta(days=10),
+                              index[-1]+pd.Timedelta(days=3))
+        ser = fred["DGS1"].rename("DGS1").sort_index()
+        ser = ser.reindex(index).ffill()
+        rf_annual = ser / 100.0
         rf_daily = rf_annual / TRADING_DAYS
-        rf_meta = "RF: FRED DGS1 (1Y Treasury, ann.)"
-        return rf_daily, rf_meta
-
-    rf_daily = pd.Series(fallback_annual_rf / TRADING_DAYS, index=index)
-    rf_meta = f"Fixed RF {fallback_annual_rf:.2%} (ann., fallback)"
-    return rf_daily, rf_meta
-
-
-###############################################################################
-# YAHOO FINANCE (RAW API, SENZA yfinance) — AdjClose/Close
-###############################################################################
-def _yahoo_chart_url(symbol: str, start_ts: int, end_ts: int) -> str:
-    return (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{symbol}"
-        f"?period1={start_ts}&period2={end_ts}"
-        "&interval=1d&events=div%2Csplit&includeAdjustedClose=true"
-    )
-
-
-def download_price_history_yahoo(ticker: str,
-                                 start: pd.Timestamp,
-                                 end: pd.Timestamp,
-                                 use_adjclose: bool) -> pd.Series | None:
-    """
-    Scarica prezzi giornalieri per ticker da Yahoo Finance.
-    Se use_adjclose=True -> 'adjclose'
-    Se use_adjclose=False -> 'close' (quote)
-    Ritorna pandas.Series indicizzata da datetime naive, name=ticker.
-    """
-    start_sec = int((start.tz_localize("UTC") - pd.Timedelta(days=3)).timestamp())
-    end_sec   = int((end.tz_localize("UTC") + pd.Timedelta(days=1)).timestamp())
-
-    kind = "adj" if use_adjclose else "close"
-    cache_key = (ticker, str(start_sec), str(end_sec), kind)
-    if cache_key in _price_cache:
-        return _price_cache[cache_key].copy()
-
-    url = _yahoo_chart_url(ticker, start_sec, end_sec)
-
-    try:
-        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return None
-        data = r.json()
+        return rf_daily, "RF: FRED DGS1 (1Y Treasury, ann.)"
     except Exception:
-        return None
+        rf_daily = pd.Series(fallback_annual_rf / TRADING_DAYS, index=index)
+        return rf_daily, f"Fixed RF {fallback_annual_rf:.2%} (ann., fallback)"
 
-    result_list = data.get("chart", {}).get("result", [])
-    if not result_list:
-        return None
-    res0 = result_list[0]
-    ts = res0.get("timestamp", [])
-    ind = res0.get("indicators", {}) or {}
-    adj = (ind.get("adjclose", [{}])[0] or {}).get("adjclose", [])
-    quo = (ind.get("quote",   [{}])[0] or {}).get("close",    [])
-
-    if use_adjclose:
-        series_vals = adj
-    else:
-        series_vals = quo if quo else adj  # fallback ad adj se close mancante
-
-    if not ts or not series_vals:
-        return None
-
-    idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None)
-    s = pd.Series(series_vals, index=idx, name=ticker, dtype=float).dropna()
-    if s.empty:
-        return None
-
-    _price_cache[cache_key] = s.copy()
-    return s
-
-
-def robust_fetch_prices_for_symbol(sym: str,
-                                   first_tx_date: pd.Timestamp,
-                                   start_buffer_days: int,
-                                   use_adjclose: bool) -> pd.Series | None:
-    """
-    Prova a scaricare i prezzi per sym provando suffissi comuni.
-    """
-    start = first_tx_date - timedelta(days=start_buffer_days)
-    end = pd.Timestamp(datetime.today().date())
-
-    for ticker_try in [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]:
-        ser = download_price_history_yahoo(ticker_try, start, end, use_adjclose=use_adjclose)
-        if ser is not None and not ser.empty:
-            return ser.rename(sym)
-        time.sleep(0.1)
-    return None
-
-
-###############################################################################
-# ALLOCAZIONI ETF (STUB SU RENDER)
-###############################################################################
+# =============================================================================
+# Allocazioni (stub su Render)
+# =============================================================================
 def get_etf_allocations(ticker: str):
     return (
         pd.DataFrame(columns=["label", "weight"]),
         pd.DataFrame(columns=["label", "weight"]),
     )
-
 
 def aggregate_allocations_portfolio(shares_df: pd.DataFrame,
                                     prices_df: pd.DataFrame,
@@ -364,54 +187,79 @@ def aggregate_allocations_portfolio(shares_df: pd.DataFrame,
         pd.DataFrame(columns=["label", "weight_portfolio"]),
     )
 
+# =============================================================================
+# Download prezzi con yfinance (identico alla logica locale)
+# =============================================================================
+def _dl_series_yf(symbol: str,
+                  start: pd.Timestamp,
+                  end: pd.Timestamp,
+                  use_adjclose: bool) -> pd.Series | None:
+    h = yf.Ticker(symbol).history(
+        start=start, end=end, interval="1d",
+        auto_adjust=True if use_adjclose else False
+    )
+    col = "Close"
+    if h is None or h.empty or col not in h.columns:
+        return None
+    s = h[col].rename(symbol.split(".")[0]).sort_index().ffill()
+    return to_naive(s)
 
-###############################################################################
-# ANALISI PORTAFOGLIO COMPLETA
-###############################################################################
+def robust_fetch_prices_for_symbol(sym: str,
+                                   first_tx_date: pd.Timestamp,
+                                   start_buffer_days: int,
+                                   use_adjclose: bool) -> pd.Series | None:
+    start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
+    end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
+    for candidate in [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]:
+        try:
+            ser = _dl_series_yf(candidate, start, end, use_adjclose=use_adjclose)
+            if ser is not None and not ser.empty:
+                return ser.rename(sym)
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return None
+
+# =============================================================================
+# ANALISI principale (identica nelle formule allo script locale)
+# =============================================================================
 def analyze_portfolio_from_text(lots_text: str,
                                 bench: str,
                                 outdir: str = "/tmp/outputs",
                                 start_buffer_days: int = 7,
                                 use_adjclose: bool = False):
     """
-    Allinea il comportamento allo script locale:
-    - di default use_adjclose=False (usa 'Close')
-    - e sostituisce il prezzo del giorno-trade con il prezzo immesso nel file (px_file)
+    Default = use_adjclose=False:
+      - usa 'Close' yfinance
+      - sostituisce il prezzo del giorno-trade con il prezzo del file (px_file)
+    Così i risultati replicano lo script locale.
     """
-
     os.makedirs(outdir, exist_ok=True)
 
-    # 1) parse lotti
     lots = read_lots_from_text(lots_text)
     first_tx_date = lots["data"].min()
+    bench = bench.upper()
 
-    tickers_portafoglio = sorted(set(lots["ticker"].tolist()))
-    all_tickers = sorted(set(tickers_portafoglio + [bench]))
+    tickers_port = sorted(set(lots["ticker"].tolist()))
+    all_tickers = sorted(set(tickers_port + [bench]))
 
-    # 2) scarica prezzi
-    price_series = {}
+    # Prezzi da yfinance
+    series = {}
     for sym in all_tickers:
         s = robust_fetch_prices_for_symbol(sym, first_tx_date, start_buffer_days, use_adjclose=use_adjclose)
         if s is not None and not s.empty:
-            price_series[sym] = s.astype(float)
+            series[sym] = s.astype(float)
         time.sleep(0.1)
+    if not series:
+        raise RuntimeError(f"Nessun prezzo disponibile per: {all_tickers}")
 
-    if len(price_series) == 0:
-        raise RuntimeError(f"Nessun dato prezzi disponibile per i ticker richiesti: {all_tickers}.")
-
-    px_list = [ser for ser in price_series.values() if ser is not None and not ser.empty]
-    if len(px_list) == 0:
-        raise RuntimeError(f"Nessuna serie valida dopo il download. Tickers richiesti: {all_tickers}")
-
-    px = pd.concat(px_list, axis=1).sort_index().ffill()
+    px = pd.concat(series.values(), axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
     px = px.loc[px.index >= (first_tx_date - timedelta(days=start_buffer_days))]
 
-    # 3) ricostruisci shares + crea px_eff = px e sovrascrivi il prezzo del giorno-trade
-    present = sorted(set(px.columns) & set(tickers_portafoglio))
+    # Ricostruzione posizioni e override prezzo trade-day
+    present = sorted(set(px.columns) & set(tickers_port))
     shares = pd.DataFrame(0.0, index=px.index, columns=present)
-
-    # px_eff = prezzi usati per la valutazione del portafoglio (con override del trade-day se use_adjclose=False)
     px_eff = px.copy()
 
     trades = []
@@ -421,37 +269,30 @@ def analyze_portfolio_from_text(lots_text: str,
         qty = float(r["quantità"])
         px_file = float(r["prezzo"])
 
-        # mappiamo alla prima data di mercato >= d
         pos = px.index.searchsorted(d, side="left")
         if pos >= len(px.index):
             continue
         d_eff = px.index[pos]
-
-        # salva trade
         trades.append((sym, d, d_eff, qty, px_file))
 
-        # accumula quantità dal giorno effettivo
         if sym in shares.columns:
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-        # *** COMPORTAMENTO LOCALE ***
-        # Se NON usiamo AdjClose, usiamo 'Close' e SOSTITUIAMO il prezzo
-        # del giorno-trade con quello del file (px_file) per la valutazione.
+        # identico al locale: se NON adjclose, forziamo il prezzo del file al trade day
         if not use_adjclose and (sym in px_eff.columns) and (d_eff in px_eff.index):
             try:
                 px_eff.at[d_eff, sym] = float(px_file)
             except Exception:
                 pass
 
-    # 4) valore portafoglio giornaliero (usando px_eff)
+    # Valore portafoglio
     port_val = (shares * px_eff[present]).sum(axis=1)
-    first_mv_mask = port_val > 0
-    if not first_mv_mask.any():
+    first_mv = port_val[port_val > 0].first_valid_index()
+    if first_mv is None:
         raise RuntimeError("Portafoglio senza valore positivo (controlla i lotti).")
-    first_mv_date = first_mv_mask.idxmax()
-    port_val = port_val.loc[first_mv_date:].dropna()
+    port_val = port_val.loc[first_mv:].dropna()
 
-    # 5) benchmark value series (sempre dai prezzi 'px' reali)
+    # Benchmark sui prezzi reali (nessun override)
     if bench in px.columns:
         bench_val_raw = px[bench].dropna()
         bench_name = bench
@@ -459,46 +300,40 @@ def analyze_portfolio_from_text(lots_text: str,
         bench_val_raw = port_val.copy()
         bench_name = "PORTFOLIO"
 
-    # allinea date
     idx_common = port_val.index.intersection(bench_val_raw.index)
     port_val = port_val.loc[idx_common]
     bench_val = bench_val_raw.loc[idx_common]
-
     if len(port_val) == 0 or len(bench_val) == 0:
         raise RuntimeError("Serie portafoglio/benchmark vuote dopo allineamento date.")
 
-    # 6) flussi di cassa (positivo = acquisto/contributo)
+    # Cash flows (come locale: usa px_file quando not use_adjclose)
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file in trades:
         if d_eff in cf.index:
-            # nel locale, il flusso usa px_eff_trade: qui è px_file quando use_adjclose=False
             invest_today = px_file if not use_adjclose else float(px.loc[d_eff, sym])
             cf.loc[d_eff] += qty * invest_today
 
-    # 7) TWR base 100
+    # TWR base 100
     dates = port_val.index
-    twr_chunks = []
+    twr_ret = []
     for i in range(1, len(dates)):
         t, tm = dates[i], dates[i - 1]
         mv_t, mv_tm = float(port_val.loc[t]), float(port_val.loc[tm])
         cf_t = float(cf.loc[t])
-        if mv_tm > 0:
-            twr_chunks.append((mv_t - cf_t) / mv_tm - 1)
-        else:
-            twr_chunks.append(0.0)
-    twr_ret = pd.Series(twr_chunks, index=dates[1:])
+        twr_ret.append((mv_t - cf_t) / mv_tm - 1 if mv_tm > 0 else 0.0)
+    twr_ret = pd.Series(twr_ret, index=dates[1:])
     port_idx = (1 + twr_ret).cumprod() * 100.0
     port_idx = pd.concat([pd.Series([100.0], index=dates[:1]), port_idx])
 
-    # 8) benchmark base 100
+    # Benchmark base 100
     bench_ret = bench_val.pct_change()
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
 
-    # 9) Risk-free daily (FRED o fallback 4%)
+    # Risk-free
     rf_daily, rf_meta = build_rf_daily_series_web(twr_ret.index)
 
-    # 10) PME (replica flussi sul benchmark)
+    # PME
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -509,83 +344,54 @@ def analyze_portfolio_from_text(lots_text: str,
         bench_pme_val.append(units * px_b)
     bench_pme_val = pd.Series(bench_pme_val, index=port_val.index)
 
-    # 11) Rischio 12m / Sharpe / VaR
+    # Rischio 12m / Sharpe / VaR
     lb = TRADING_DAYS
-
-    # Portafoglio
     port_r_12m = (twr_ret.iloc[-lb:] if len(twr_ret) >= lb else twr_ret.dropna()).copy()
     rf_12m = rf_daily.reindex(port_r_12m.index).ffill().fillna(0.0)
-
     vol_port_12m = np.nan if port_r_12m.empty else float(port_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
-
     sharpe_port_12m = np.nan
     if (not port_r_12m.empty) and (port_r_12m.std(ddof=1) > 0):
         ex = port_r_12m - rf_12m
         sharpe_port_12m = float(np.sqrt(TRADING_DAYS) * ex.mean() / ex.std(ddof=1))
-
     z_95 = 1.65
     sigma_1d = float(port_r_12m.std(ddof=1)) if not port_r_12m.empty else np.nan
     var95_pct = np.nan if np.isnan(sigma_1d) else z_95 * sigma_1d
     current_value_port = float(port_val.iloc[-1])
     var95_usd = np.nan if np.isnan(var95_pct) else var95_pct * current_value_port
 
-    # Benchmark
     bench_r_12m = (bench_ret.iloc[-lb:] if len(bench_ret) >= lb else bench_ret.dropna()).copy()
     rf_12m_b = rf_daily.reindex(bench_r_12m.index).ffill().fillna(0.0)
-
     vol_bench_12m = np.nan if bench_r_12m.empty else float(bench_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
-
     sharpe_bench_12m = np.nan
     if (not bench_r_12m.empty) and (bench_r_12m.std(ddof=1) > 0):
         exb = bench_r_12m - rf_12m_b
         sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))
-
     sigma_1d_b = float(bench_r_12m.std(ddof=1)) if not bench_r_12m.empty else np.nan
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     current_value_bench_pme = float(bench_pme_val.iloc[-1])
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
-    # 12) Summary IRR / PME
-    contrib = cf.clip(upper=0) * -1.0   # soldi entrati (acquisti)
-    withdrw = cf.clip(lower=0)          # soldi usciti (vendite)
+    # Summary / IRR
+    contrib = cf.clip(upper=0) * -1.0
+    withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
     gross_withdrw = float(withdrw.sum())
     net_invested = float(cf.sum())
 
     current_value_port_val = current_value_port
     current_value_pme = float(bench_pme_val.iloc[-1])
-
     r_net_port = (current_value_port_val / net_invested - 1) if net_invested > 0 else np.nan
     r_net_bench = (current_value_pme / net_invested - 1) if net_invested > 0 else np.nan
-    r_net_excess = (
-        r_net_port - r_net_bench
-        if (np.isfinite(r_net_port) and np.isfinite(r_net_bench))
-        else np.nan
-    )
+    r_net_excess = (r_net_port - r_net_bench) if (np.isfinite(r_net_port) and np.isfinite(r_net_bench)) else np.nan
 
-    cf_list = [
-        (t, -float(cf.loc[t]))
-        for t in port_val.index
-        if abs(float(cf.loc[t])) != 0.0
-    ]
-    cf_port = sorted(
-        cf_list + [(port_val.index[-1], current_value_port_val)],
-        key=lambda x: x[0]
-    )
-    cf_bench = sorted(
-        cf_list + [(port_val.index[-1], current_value_pme)],
-        key=lambda x: x[0]
-    )
-
+    cf_list = [(t, -float(cf.loc[t])) for t in port_val.index if abs(float(cf.loc[t])) != 0.0]
+    cf_port = sorted(cf_list + [(port_val.index[-1], current_value_port_val)], key=lambda x: x[0])
+    cf_bench = sorted(cf_list + [(port_val.index[-1], current_value_pme)], key=lambda x: x[0])
     irr_port = xirr(cf_port)
     irr_bench = xirr(cf_bench)
-    irr_excess = (
-        irr_port - irr_bench
-        if (np.isfinite(irr_port) and np.isfinite(irr_bench))
-        else np.nan
-    )
+    irr_excess = (irr_port - irr_bench) if (np.isfinite(irr_port) and np.isfinite(irr_bench)) else np.nan
 
-    # 13) Grafico cumulato
+    # Grafico
     mode_label = "AdjClose (ignora prezzo file)" if use_adjclose else "Close (usa prezzo file al trade day)"
     plot_path = os.path.join(outdir, "crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
@@ -599,25 +405,21 @@ def analyze_portfolio_from_text(lots_text: str,
     plt.savefig(plot_path, dpi=160)
     plt.close()
 
-    # 14) Allocazioni (stub lato Render)
+    # Alloc (stub)
     sectors_p, countries_p = aggregate_allocations_portfolio(
-        shares_df=shares[present],
-        prices_df=px_eff,   # coerenza con la valutazione portafoglio
-        tickers=present,
-        bench=bench_name,
+        shares_df=shares[present], prices_df=px, tickers=present, bench=bench_name
     )
-
     bench_sectors, bench_countries = get_etf_allocations(bench_name)
     if not bench_sectors.empty:
         bench_sectors = bench_sectors.rename(columns={"weight": "weight_portfolio"}).copy()
     else:
-        bench_sectors = pd.DataFrame(columns=["label", "weight_portfolio"])
+        bench_sectors = pd.DataFrame(columns=["label","weight_portfolio"])
     if not bench_countries.empty:
         bench_countries = bench_countries.rename(columns={"weight": "weight_portfolio"}).copy()
     else:
-        bench_countries = pd.DataFrame(columns=["label", "weight_portfolio"])
+        bench_countries = pd.DataFrame(columns=["label","weight_portfolio"])
 
-    # 15) Summary lines (umane)
+    # Summary lines
     summary_lines = []
     summary_lines.append("=== SUMMARY (Benchmark PME-consistent) ===")
     rows_out = [
@@ -646,12 +448,12 @@ def analyze_portfolio_from_text(lots_text: str,
     for k, v in rows_out:
         summary_lines.append(f"{k.ljust(45)} {v}")
 
-    # 16) Salva summary.txt
+    # Salva summary.txt
     sum_path = os.path.join(outdir, "summary.txt")
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
-    # 17) Ritorno JSON-friendly
+    # Output
     out = {
         "summary_lines": summary_lines,
         "plot_path": plot_path,
@@ -684,5 +486,4 @@ def analyze_portfolio_from_text(lots_text: str,
             "bench_countries": bench_countries.to_dict(orient="records"),
         },
     }
-
     return out
