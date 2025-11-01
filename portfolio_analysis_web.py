@@ -75,29 +75,108 @@ def map_to_effective_date(d: pd.Timestamp, idx: pd.DatetimeIndex) -> pd.Timestam
 # Parser lotti robusto (tabs / spazi / virgola decimale)
 # -----------------------------------------------------------------------------
 def read_lots_from_text(txt: str) -> pd.DataFrame:
+    """
+    Formato atteso (tollerante a TAB, spazi multipli, virgole/punti come separatori,
+    migliaia, spazi unificatori, ecc.):
+      TICKER  DATA         QTA     PREZZO
+      ACWI    2012-12-21   200     47.81
+      ACWV    2017-05-04   270     77.9683
+      EEM     2025-08-20   -150    49,71
+    """
+    def to_number_strict(x_raw: str) -> float:
+        """
+        Converte stringhe numeriche molto “sporche”:
+        - rimuove spazi normali e non-breaking (U+00A0, U+202F)
+        - gestisce migliaia e decimali con virgola o punto
+        - accetta segni +/-
+        Esempi validi: "1 234,56" -> 1234.56 ; "1,234.56" -> 1234.56 ; "77.9683" ; "-150"
+        """
+        if x_raw is None:
+            raise ValueError("numero mancante")
+
+        s = str(x_raw).strip()
+
+        # normalizza spazi “strani”
+        for ws in ("\u00A0", "\u202F"):
+            s = s.replace(ws, "")
+        s = s.replace(" ", "").replace("\t", "")
+
+        # tieni solo cifre, virgole, punti e segni
+        s = re.sub(r"[^0-9,.\-\+]", "", s)
+
+        if s == "" or s in {"+", "-"}:
+            raise ValueError(f"numero vuoto: '{x_raw}'")
+
+        # se contiene sia virgola che punto, decide chi è il decimale guardando l’ultimo separatore
+        if "," in s and "." in s:
+            last_dot = s.rfind(".")
+            last_com = s.rfind(",")
+            if last_dot > last_com:
+                # punto = decimale, togli le virgole come migliaia
+                s = s.replace(",", "")
+            else:
+                # virgola = decimale, togli i punti come migliaia e sostituisci virgola con punto
+                s = s.replace(".", "").replace(",", ".")
+        elif "," in s:
+            # solo virgola presente: se più di una, consideriamo tutte migliaia tranne l’ultima
+            if s.count(",") > 1:
+                # es: "1,234,567,89" -> rimuovi tutte le virgole tranne l’ultima
+                parts = s.split(",")
+                s = "".join(parts[:-1]) + "." + parts[-1]
+            else:
+                s = s.replace(",", ".")
+        else:
+            # solo punto o niente: se più di un punto, rimuovi tutti tranne l’ultimo come migliaia
+            if s.count(".") > 1:
+                parts = s.split(".")
+                s = "".join(parts[:-1]) + "." + parts[-1]
+
+        try:
+            return float(s)
+        except Exception as ex:
+            raise ValueError(f"numero non convertibile: '{x_raw}' -> '{s}'") from ex
+
+    # --- pulizia righe ---
     lines = []
     for ln in txt.splitlines():
-        if not ln.strip() or ln.strip().startswith("#"):
+        ln_strip = (ln or "").strip()
+        if not ln_strip or ln_strip.startswith("#"):
             continue
-        lines.append(ln.strip())
+        lines.append(ln_strip)
     if not lines:
         raise ValueError("Nessuna riga valida nei lotti.")
 
+    # --- parsing righe ---
     rows = []
     for ln in lines:
+        # split molto tollerante: virgole, punto e virgola, TAB, spazi multipli
         parts = re.split(r"[,\t;]+|\s+", ln.strip())
+        # filtra eventuali token vuoti residui
+        parts = [p for p in parts if str(p).strip() != ""]
         if len(parts) < 4:
-            raise ValueError(f"Riga lotti invalida: {ln}")
-        ticker = parts[0].strip().upper()
-        data = to_date(parts[1])
-        # quantità e prezzo: accetta qualsiasi numero con decimali
-        def to_float(x): 
-            return float(str(x).strip().replace(" ", "").replace(",", "."))
-        qty = to_float(parts[2])
-        px  = to_float(parts[3])
+            raise ValueError(f"Riga lotti invalida (attese 4 colonne): {ln}")
+
+        ticker = str(parts[0]).strip().upper()
+        try:
+            data = to_date(parts[1])
+        except Exception:
+            raise ValueError(f"Data non riconosciuta nella riga: {ln}")
+
+        try:
+            qty = to_number_strict(parts[2])   # consente anche quantità negative (vendite)
+        except Exception as ex:
+            raise ValueError(f"Quantità non valida nella riga: {ln} | {ex}")
+
+        try:
+            px = to_number_strict(parts[3])
+        except Exception as ex:
+            raise ValueError(f"Prezzo non valido nella riga: {ln} | {ex}")
+
         rows.append((ticker, data, qty, px))
+
     df = pd.DataFrame(rows, columns=["ticker", "data", "quantità", "prezzo"])
-    return df.sort_values("data").reset_index(drop=True)
+    df = df.sort_values("data").reset_index(drop=True)
+    return df
 
 # -----------------------------------------------------------------------------
 # Risk-free (FRED se disponibile via requests? qui fallback fisso)
