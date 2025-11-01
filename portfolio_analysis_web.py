@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -67,53 +68,113 @@ def xirr(cf):
     return mid
 
 
-# ---------------- Input lots ----------------
+# ---------------- Normalizzazione & numeri robusti ----------------
+
+_UNICODE_MINUS = "\u2212"  # −
+_UNICODE_HYPHENS = ["\u2212", "\u2013", "\u2014", "\u2010"]  # − – — ‐
+
+def _normalize_line(s: str) -> str:
+    """
+    - Normalizza Unicode (NFKC)
+    - Rimpiazza 'minus' e trattini unicode con '-'
+    - Rimuove NBSP e thin space
+    - Trim
+    """
+    if s is None:
+        return ""
+    # Normalize unicode (compatibility)
+    s = unicodedata.normalize("NFKC", s)
+    # Replace unicode minus/hyphens with ASCII '-'
+    for ch in _UNICODE_HYPHENS:
+        s = s.replace(ch, "-")
+    # Remove NBSP and NARROW NBSP
+    s = s.replace("\u00A0", " ").replace("\u202F", " ")
+    # Collapse weird spaces
+    s = re.sub(r"[ \t\r\f\v]+", " ", s)
+    return s.strip()
 
 def _to_float_robust(val: str) -> float:
     """
     Converte stringhe come:
-      ' 270 ', '77,9683', '77.9683', '1 234,56', '1 234.56', '1.234,56'
-    rimuovendo whitespace/nbspace e caratteri spurî.
+      '270', ' 270 ', '77,9683', '77.9683', '1 234,56', '1.234,56', '1 234,56'
+    Tollerante a simboli, valute, unità e spazzatura.
     """
-    s = str(val)
-    # rimuovi NBSP e whitespace unicode
+    raw = str(val) if val is not None else ""
+    s = unicodedata.normalize("NFKC", raw)
+    # uniforma minus/hyphen
+    for ch in _UNICODE_HYPHENS:
+        s = s.replace(ch, "-")
+    # togli spazi (normali e NBSP/thin)
     s = s.replace("\u00A0", "").replace("\u202F", "")
     s = re.sub(r"\s+", "", s)
-    # normalizza virgola -> punto
+    # virgola -> punto
     s = s.replace(",", ".")
-    # tieni solo cifre, punto e segno meno
-    s = re.sub(r"[^0-9\.\-]", "", s)
-    # se ci sono troppi punti (es. '1.234.567.89'): tieni il primo come separatore decimale
+    # tieni solo cifre, punto e -
+    s = re.sub(r"[^0-9.\-]", "", s)
+    # ripulisci punti multipli: mantieni il primo, rimuovi i successivi
     if s.count(".") > 1:
         head, tail = s.split(".", 1)
         tail = tail.replace(".", "")
         s = f"{head}.{tail}"
     if s in ("", ".", "-", "-.", ".-"):
-        raise ValueError(f"Stringa numerica vuota/non valida: '{val}'")
-    return float(s)
+        raise ValueError(f"Stringa numerica non valida: {repr(raw)}")
+    try:
+        return float(s)
+    except Exception:
+        raise ValueError(f"Impossibile convertire a float: {repr(raw)} -> '{s}'")
+
+
+# ---------------- Input lots ----------------
 
 def read_lots_from_text(txt: str) -> pd.DataFrame:
     """
     Accetta righe tipo:
       TICKER YYYY-MM-DD QTY PRICE
     separatori: spazi multipli / tab / virgole / ';'
+    È molto tollerante a sporcizia Unicode.
     """
-    lines = [ln for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    if not lines:
+    if txt is None:
+        raise ValueError("lots_text mancante.")
+    # normalizza TUTTO il blocco per prevenire caratteri strani
+    norm_lines = []
+    for ln in txt.splitlines():
+        ln = _normalize_line(ln)
+        if not ln or ln.startswith("#"):
+            continue
+        norm_lines.append(ln)
+
+    if not norm_lines:
         raise ValueError("Nessuna riga valida nei lotti.")
 
     rows = []
-    for ln in lines:
+    for ln in norm_lines:
+        # split su virgole/; oppure qualsiasi whitespace
         parts = re.split(r"[,\t;]+|\s+", ln.strip())
+        # alcuni copy&paste possono inserire token vuoti
+        parts = [p for p in parts if p is not None and str(p).strip() != ""]
         if len(parts) < 4:
-            raise ValueError(f"Riga lotti invalida: {ln}")
-        ticker = parts[0].strip().upper()
-        data = to_date(parts[1])
+            raise ValueError(f"Riga lotti invalida (colonne < 4): {repr(ln)}")
+
+        ticker = str(parts[0]).strip().upper()
+        data_str = parts[1]
+        qty_str  = parts[2]
+        px_str   = parts[3]
+
         try:
-            qty = _to_float_robust(parts[2])    # gestisce anche quantità negative (vendite)
-            px  = _to_float_robust(parts[3])
+            data = to_date(data_str)
         except Exception:
-            raise ValueError(f"Quantità o prezzo non valido: '{ln}'")
+            raise ValueError(f"Data non valida: {repr(data_str)} (riga: {repr(ln)})")
+
+        try:
+            qty = _to_float_robust(qty_str)    # può essere negativo (vendita)
+        except Exception as e:
+            raise ValueError(f"Quantità non valida: {repr(qty_str)} (riga: {repr(ln)}) | {e}")
+
+        try:
+            px  = _to_float_robust(px_str)
+        except Exception as e:
+            raise ValueError(f"Prezzo non valido: {repr(px_str)} (riga: {repr(ln)}) | {e}")
+
         rows.append((ticker, data, qty, px))
 
     df = pd.DataFrame(rows, columns=["ticker", "data", "quantità", "prezzo"])
@@ -303,7 +364,7 @@ def analyze_portfolio_from_text(
     sharpe_bench_12m = np.nan
     if not bench_r_12m.empty and bench_r_12m.std(ddof=1) > 0:
         exb = bench_r_12m - rf_12m_b
-        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))  # <-- fix: exb
+        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))
     sigma_1d_b = float(bench_r_12m.std(ddof=1)) if not bench_r_12m.empty else np.nan
     current_value_bench_pme = float(bench_pme_val.iloc[-1])
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
