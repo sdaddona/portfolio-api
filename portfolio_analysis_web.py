@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import unicodedata
 from datetime import datetime, timedelta
 
@@ -11,6 +12,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import yfinance as yf
 from pandas_datareader import data as pdr  # FRED
+import requests
 
 TRADING_DAYS = 252
 
@@ -29,7 +31,6 @@ def to_date(s: str) -> pd.Timestamp:
     s = str(s).strip()
     dt = pd.to_datetime(s, errors="coerce")
     if pd.isna(dt):
-        # tenta dayfirst
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if pd.isna(dt):
         raise ValueError(f"Data non riconosciuta: {s}")
@@ -70,48 +71,27 @@ def xirr(cf):
 
 # ---------------- Normalizzazione & numeri robusti ----------------
 
-_UNICODE_MINUS = "\u2212"  # −
 _UNICODE_HYPHENS = ["\u2212", "\u2013", "\u2014", "\u2010"]  # − – — ‐
 
 def _normalize_line(s: str) -> str:
-    """
-    - Normalizza Unicode (NFKC)
-    - Rimpiazza 'minus' e trattini unicode con '-'
-    - Rimuove NBSP e thin space
-    - Trim
-    """
     if s is None:
         return ""
-    # Normalize unicode (compatibility)
     s = unicodedata.normalize("NFKC", s)
-    # Replace unicode minus/hyphens with ASCII '-'
     for ch in _UNICODE_HYPHENS:
         s = s.replace(ch, "-")
-    # Remove NBSP and NARROW NBSP
     s = s.replace("\u00A0", " ").replace("\u202F", " ")
-    # Collapse weird spaces
     s = re.sub(r"[ \t\r\f\v]+", " ", s)
     return s.strip()
 
 def _to_float_robust(val: str) -> float:
-    """
-    Converte stringhe come:
-      '270', ' 270 ', '77,9683', '77.9683', '1 234,56', '1.234,56', '1 234,56'
-    Tollerante a simboli, valute, unità e spazzatura.
-    """
     raw = str(val) if val is not None else ""
     s = unicodedata.normalize("NFKC", raw)
-    # uniforma minus/hyphen
     for ch in _UNICODE_HYPHENS:
         s = s.replace(ch, "-")
-    # togli spazi (normali e NBSP/thin)
     s = s.replace("\u00A0", "").replace("\u202F", "")
     s = re.sub(r"\s+", "", s)
-    # virgola -> punto
     s = s.replace(",", ".")
-    # tieni solo cifre, punto e -
     s = re.sub(r"[^0-9.\-]", "", s)
-    # ripulisci punti multipli: mantieni il primo, rimuovi i successivi
     if s.count(".") > 1:
         head, tail = s.split(".", 1)
         tail = tail.replace(".", "")
@@ -127,15 +107,8 @@ def _to_float_robust(val: str) -> float:
 # ---------------- Input lots ----------------
 
 def read_lots_from_text(txt: str) -> pd.DataFrame:
-    """
-    Accetta righe tipo:
-      TICKER YYYY-MM-DD QTY PRICE
-    separatori: spazi multipli / tab / virgole / ';'
-    È molto tollerante a sporcizia Unicode.
-    """
     if txt is None:
         raise ValueError("lots_text mancante.")
-    # normalizza TUTTO il blocco per prevenire caratteri strani
     norm_lines = []
     for ln in txt.splitlines():
         ln = _normalize_line(ln)
@@ -148,9 +121,7 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
 
     rows = []
     for ln in norm_lines:
-        # split su virgole/; oppure qualsiasi whitespace
         parts = re.split(r"[,\t;]+|\s+", ln.strip())
-        # alcuni copy&paste possono inserire token vuoti
         parts = [p for p in parts if p is not None and str(p).strip() != ""]
         if len(parts) < 4:
             raise ValueError(f"Riga lotti invalida (colonne < 4): {repr(ln)}")
@@ -166,7 +137,7 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
             raise ValueError(f"Data non valida: {repr(data_str)} (riga: {repr(ln)})")
 
         try:
-            qty = _to_float_robust(qty_str)    # può essere negativo (vendita)
+            qty = _to_float_robust(qty_str)
         except Exception as e:
             raise ValueError(f"Quantità non valida: {repr(qty_str)} (riga: {repr(ln)}) | {e}")
 
@@ -192,7 +163,6 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
         return rf_daily, rf_meta
 
     if rf_source == "irx_13w":
-        # 13-week T-Bill (^IRX)
         try:
             h = yf.Ticker("^IRX").history(start=index[0]-pd.Timedelta(days=10),
                                           end=index[-1]+pd.Timedelta(days=3),
@@ -202,9 +172,8 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
             rf_daily = rf_annual / TRADING_DAYS
             return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
         except Exception:
-            pass  # fallback sotto
+            pass
 
-    # default: FRED DGS1
     try:
         fred = pdr.DataReader("DGS1", "fred",
                               index[0]-pd.Timedelta(days=10),
@@ -217,6 +186,92 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
     except Exception:
         rf_daily = pd.Series(rf / TRADING_DAYS, index=index)
         return rf_daily, "RF fallback (FRED failed)"
+
+
+# ---------------- Yahoo fetch (fallback diretto) ----------------
+
+def _yahoo_chart_url(symbol: str, start_ts: int, end_ts: int) -> str:
+    # interval=1d, includiamo adjclose
+    return (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{symbol}"
+        f"?period1={start_ts}&period2={end_ts}"
+        "&interval=1d&events=div%2Csplit&includeAdjustedClose=true"
+    )
+
+def _download_yahoo_direct(symbol: str, start: pd.Timestamp, end: pd.Timestamp, want_adjclose: bool) -> pd.Series | None:
+    # Yahoo vuole epoch seconds (UTC); aggiungiamo buffer +/- qualche giorno
+    start_utc = (start.tz_localize("UTC") - pd.Timedelta(days=3)).timestamp()
+    end_utc   = (end.tz_localize("UTC") + pd.Timedelta(days=2)).timestamp()
+    url = _yahoo_chart_url(symbol, int(start_utc), int(end_utc))
+
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+    except Exception:
+        return None
+
+    chart = data.get("chart", {})
+    results = chart.get("result", [])
+    if not results:
+        return None
+    r0 = results[0]
+    ts = r0.get("timestamp", [])
+    if not ts:
+        return None
+
+    indicators = r0.get("indicators", {})
+    adj = indicators.get("adjclose", [{}])
+    qte = indicators.get("quote", [{}])
+
+    series_vals = None
+    if want_adjclose:
+        series_vals = adj[0].get("adjclose", []) if adj else []
+    else:
+        series_vals = qte[0].get("close", []) if qte else []
+
+    if not series_vals or len(series_vals) != len(ts):
+        return None
+
+    idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None)
+    s = pd.Series(series_vals, index=idx, dtype=float)
+    s = s.dropna()
+    return s if not s.empty else None
+
+def _fetch_series_with_fallback(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> dict:
+    """
+    Per ogni simbolo prova:
+      1) yfinance (come in locale)
+      2) yahoo v8 chart diretto (con suffissi .US / .L / .MI)
+    Ritorna: dict[symbol] = pandas.Series
+    """
+    out = {}
+    for sym in symbols:
+        got = None
+        # 1) yfinance
+        try:
+            h = yf.Ticker(sym).history(start=start, end=end, interval="1d",
+                                       auto_adjust=use_adjclose)
+            if isinstance(h, pd.DataFrame) and not h.empty and "Close" in h.columns:
+                s = h["Close"].rename(sym).sort_index().ffill()
+                got = to_naive(s)
+        except Exception:
+            pass
+
+        # 2) fallback diretto (anche con suffissi)
+        if got is None or got.empty:
+            for cand in [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]:
+                s2 = _download_yahoo_direct(cand, start, end, want_adjclose=use_adjclose)
+                if s2 is not None and not s2.empty:
+                    got = s2.rename(sym)
+                    break
+
+        if got is not None and not got.empty:
+            out[sym] = got
+        time.sleep(0.15)  # mini throttle
+    return out
 
 
 # ---------------- Core analysis ----------------
@@ -236,36 +291,12 @@ def analyze_portfolio_from_text(
     first_tx_date = lots["data"].min()
     bench = bench.upper()
 
-    # Risoluzione "soft" dei ticker su Yahoo (prova suffissi comuni)
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
-    resolved = {}
-    for s in tickers:
-        ok = None
-        for t in [s, f"{s}.US", f"{s}.L", f"{s}.MI"]:
-            try:
-                h = yf.Ticker(t).history(period="10d")
-                if isinstance(h, pd.DataFrame) and not h.empty:
-                    ok = t
-                    break
-            except Exception:
-                pass
-        resolved[s] = ok or s
 
-    # Prezzi
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
-    series = {}
-    for k, ysym in resolved.items():
-        try:
-            h = yf.Ticker(ysym).history(start=start, end=end, interval="1d",
-                                        auto_adjust=use_adjclose)
-            if h is None or h.empty or "Close" not in h.columns:
-                continue
-            s = h["Close"].rename(k).sort_index().ffill()
-            series[k] = to_naive(s)
-        except Exception:
-            continue
-        time.sleep(0.2)
+
+    series = _fetch_series_with_fallback(tickers, start, end, use_adjclose=use_adjclose)
     if not series:
         raise RuntimeError(f"Nessun prezzo disponibile per: {tickers}")
 
@@ -280,12 +311,10 @@ def analyze_portfolio_from_text(
         d = r["data"]
         qty = float(r["quantità"])
         px_file = float(r["prezzo"])
-        # mappa alla prima data >= trade date
         pos = calendar.searchsorted(d, side="left")
         if pos >= len(calendar):
             continue
         d_eff = calendar[pos]
-        # se use_adjclose True, usiamo prezzo storico; altrimenti prezzo del file nel giorno d_eff
         px_eff_trade = float(px.loc[d_eff, sym]) if use_adjclose else px_file
         trades.append((sym, d, d_eff, qty, px_file, px_eff_trade))
 
@@ -437,7 +466,7 @@ def analyze_portfolio_from_text(
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
-    # Allocazioni (placeholder vuoti su Render)
+    # Allocazioni (placeholder su Render)
     alloc = {
         "portfolio_sectors": [],
         "portfolio_countries": [],
