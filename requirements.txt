@@ -1,11 +1,11 @@
-flask==3.0.3
-flask-cors==4.0.1
+Flask==3.0.3
 gunicorn==23.0.0
-pandas==2.2.2
 numpy==1.26.4
+pandas==2.2.2
 matplotlib==3.9.2
 requests==2.32.3
-pytz==2025.2
-python-dateutil==2.9.0.post0
-peewee==3.18.2
+yfinance==0.2.43
 pandas-datareader==0.10.0
+beautifulsoup4==4.12.3
+lxml==6.0.2
+html5lib==1.1
