@@ -16,7 +16,6 @@ import requests
 
 TRADING_DAYS = 252
 
-
 # ---------------- Utils ----------------
 
 def to_naive(obj):
@@ -68,7 +67,6 @@ def xirr(cf):
             lo = mid
     return mid
 
-
 # ---------------- Normalizzazione & numeri robusti ----------------
 
 _UNICODE_HYPHENS = ["\u2212", "\u2013", "\u2014", "\u2010"]  # − – — ‐
@@ -103,7 +101,6 @@ def _to_float_robust(val: str) -> float:
     except Exception:
         raise ValueError(f"Impossibile convertire a float: {repr(raw)} -> '{s}'")
 
-
 # ---------------- Input lots ----------------
 
 def read_lots_from_text(txt: str) -> pd.DataFrame:
@@ -115,7 +112,6 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
         if not ln or ln.startswith("#"):
             continue
         norm_lines.append(ln)
-
     if not norm_lines:
         raise ValueError("Nessuna riga valida nei lotti.")
 
@@ -125,43 +121,34 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
         parts = [p for p in parts if p is not None and str(p).strip() != ""]
         if len(parts) < 4:
             raise ValueError(f"Riga lotti invalida (colonne < 4): {repr(ln)}")
-
         ticker = str(parts[0]).strip().upper()
         data_str = parts[1]
         qty_str  = parts[2]
         px_str   = parts[3]
-
         try:
             data = to_date(data_str)
         except Exception:
             raise ValueError(f"Data non valida: {repr(data_str)} (riga: {repr(ln)})")
-
         try:
             qty = _to_float_robust(qty_str)
         except Exception as e:
             raise ValueError(f"Quantità non valida: {repr(qty_str)} (riga: {repr(ln)}) | {e}")
-
         try:
             px  = _to_float_robust(px_str)
         except Exception as e:
             raise ValueError(f"Prezzo non valido: {repr(px_str)} (riga: {repr(ln)}) | {e}")
-
         rows.append((ticker, data, qty, px))
-
     df = pd.DataFrame(rows, columns=["ticker", "data", "quantità", "prezzo"])
     return df.sort_values("data").reset_index(drop=True)
-
 
 # ---------------- Risk-free ----------------
 
 def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04):
     rf_source = (rf_source or "fred_1y").lower()
-
     if rf_source == "fixed":
         rf_daily = pd.Series(rf / TRADING_DAYS, index=index)
         rf_meta = f"Fixed RF {rf:.2%} (ann.)"
         return rf_daily, rf_meta
-
     if rf_source == "irx_13w":
         try:
             h = yf.Ticker("^IRX").history(start=index[0]-pd.Timedelta(days=10),
@@ -173,7 +160,6 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
             return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
         except Exception:
             pass
-
     try:
         fred = pdr.DataReader("DGS1", "fred",
                               index[0]-pd.Timedelta(days=10),
@@ -187,11 +173,9 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source="fred_1y", rf=0.04)
         rf_daily = pd.Series(rf / TRADING_DAYS, index=index)
         return rf_daily, "RF fallback (FRED failed)"
 
-
 # ---------------- Yahoo fetch (fallback diretto) ----------------
 
 def _yahoo_chart_url(symbol: str, start_ts: int, end_ts: int) -> str:
-    # interval=1d, includiamo adjclose
     return (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
         f"{symbol}"
@@ -200,11 +184,9 @@ def _yahoo_chart_url(symbol: str, start_ts: int, end_ts: int) -> str:
     )
 
 def _download_yahoo_direct(symbol: str, start: pd.Timestamp, end: pd.Timestamp, want_adjclose: bool) -> pd.Series | None:
-    # Yahoo vuole epoch seconds (UTC); aggiungiamo buffer +/- qualche giorno
     start_utc = (start.tz_localize("UTC") - pd.Timedelta(days=3)).timestamp()
     end_utc   = (end.tz_localize("UTC") + pd.Timedelta(days=2)).timestamp()
     url = _yahoo_chart_url(symbol, int(start_utc), int(end_utc))
-
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
         if r.status_code != 200:
@@ -212,7 +194,6 @@ def _download_yahoo_direct(symbol: str, start: pd.Timestamp, end: pd.Timestamp, 
         data = r.json()
     except Exception:
         return None
-
     chart = data.get("chart", {})
     results = chart.get("result", [])
     if not results:
@@ -221,36 +202,25 @@ def _download_yahoo_direct(symbol: str, start: pd.Timestamp, end: pd.Timestamp, 
     ts = r0.get("timestamp", [])
     if not ts:
         return None
-
     indicators = r0.get("indicators", {})
     adj = indicators.get("adjclose", [{}])
     qte = indicators.get("quote", [{}])
-
     series_vals = None
     if want_adjclose:
         series_vals = adj[0].get("adjclose", []) if adj else []
     else:
         series_vals = qte[0].get("close", []) if qte else []
-
     if not series_vals or len(series_vals) != len(ts):
         return None
-
     idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None)
-    s = pd.Series(series_vals, index=idx, dtype=float)
-    s = s.dropna()
+    s = pd.Series(series_vals, index=idx, dtype=float).dropna()
     return s if not s.empty else None
 
 def _fetch_series_with_fallback(symbols: list[str], start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> dict:
-    """
-    Per ogni simbolo prova:
-      1) yfinance (come in locale)
-      2) yahoo v8 chart diretto (con suffissi .US / .L / .MI)
-    Ritorna: dict[symbol] = pandas.Series
-    """
     out = {}
     for sym in symbols:
         got = None
-        # 1) yfinance
+        # 1) yfinance (come in locale)
         try:
             h = yf.Ticker(sym).history(start=start, end=end, interval="1d",
                                        auto_adjust=use_adjclose)
@@ -259,20 +229,17 @@ def _fetch_series_with_fallback(symbols: list[str], start: pd.Timestamp, end: pd
                 got = to_naive(s)
         except Exception:
             pass
-
-        # 2) fallback diretto (anche con suffissi)
+        # 2) fallback diretto con suffissi
         if got is None or got.empty:
             for cand in [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]:
                 s2 = _download_yahoo_direct(cand, start, end, want_adjclose=use_adjclose)
                 if s2 is not None and not s2.empty:
                     got = s2.rename(sym)
                     break
-
         if got is not None and not got.empty:
             out[sym] = got
-        time.sleep(0.15)  # mini throttle
+        time.sleep(0.15)
     return out
-
 
 # ---------------- Core analysis ----------------
 
@@ -303,7 +270,7 @@ def analyze_portfolio_from_text(
     px = pd.concat(series.values(), axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
 
-    # Calendario, trades e posizioni (shares)
+    # --------- CALENDARIO / TRADES / POSIZIONI (con sovrascrittura prezzo file) ---------
     calendar = px.index
     trades = []
     for _, r in lots.iterrows():
@@ -315,10 +282,19 @@ def analyze_portfolio_from_text(
         if pos >= len(calendar):
             continue
         d_eff = calendar[pos]
+        # prezzo effettivo del trade usato nei flussi
         px_eff_trade = float(px.loc[d_eff, sym]) if use_adjclose else px_file
         trades.append((sym, d, d_eff, qty, px_file, px_eff_trade))
 
-    present = sorted(set(px.columns) & set(lots["ticker"].unique()))
+    # copia dei prezzi per valorizzazione portafoglio
+    px_eff = px.copy()
+    if not use_adjclose:
+        # allinea il giorno del trade al prezzo del file (come nella versione locale)
+        for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
+            if sym in px_eff.columns and d_eff in px_eff.index:
+                px_eff.at[d_eff, sym] = px_file
+
+    present = sorted(set(px_eff.columns) & set(lots["ticker"].unique()))
     shares = pd.DataFrame(0.0, index=calendar, columns=present)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if sym not in shares.columns:
@@ -327,7 +303,8 @@ def analyze_portfolio_from_text(
         if pos < len(shares.index):
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-    port_val = (shares * px[present]).sum(axis=1)
+    # --------- Valore portafoglio: usare px_eff (patch) ---------
+    port_val = (shares * px_eff[present]).sum(axis=1)
     first_mv = port_val[port_val > 0].first_valid_index()
     port_val = port_val.loc[first_mv:].dropna()
 
@@ -336,7 +313,7 @@ def analyze_portfolio_from_text(
     port_val = port_val.loc[idx_common]
     bench_val = bench_val.loc[idx_common]
 
-    # Cash flows (positivo = acquisti)
+    # Cash flows
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if d_eff in cf.index:
@@ -466,7 +443,6 @@ def analyze_portfolio_from_text(
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
-    # Allocazioni (placeholder su Render)
     alloc = {
         "portfolio_sectors": [],
         "portfolio_countries": [],
