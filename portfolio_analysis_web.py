@@ -15,7 +15,7 @@ TRADING_DAYS = 252
 ###############################################################################
 # CACHE IN-MEMORY PER PREZZI YAHOO
 ###############################################################################
-_price_cache = {}  # dict[(ticker, start_ts, end_ts)] = pandas.Series
+_price_cache = {}  # dict[(ticker, start_ts, end_ts, kind)] = pandas.Series
 
 
 ###############################################################################
@@ -262,7 +262,7 @@ def build_rf_daily_series_web(index: pd.DatetimeIndex,
 
 
 ###############################################################################
-# YAHOO FINANCE (RAW API, SENZA yfinance)
+# YAHOO FINANCE (RAW API, SENZA yfinance) — AdjClose/Close
 ###############################################################################
 def _yahoo_chart_url(symbol: str, start_ts: int, end_ts: int) -> str:
     return (
@@ -275,16 +275,19 @@ def _yahoo_chart_url(symbol: str, start_ts: int, end_ts: int) -> str:
 
 def download_price_history_yahoo(ticker: str,
                                  start: pd.Timestamp,
-                                 end: pd.Timestamp) -> pd.Series | None:
+                                 end: pd.Timestamp,
+                                 use_adjclose: bool) -> pd.Series | None:
     """
-    Scarica prezzi giornalieri Adjusted Close per ticker da Yahoo Finance.
+    Scarica prezzi giornalieri per ticker da Yahoo Finance.
+    Se use_adjclose=True -> 'adjclose'
+    Se use_adjclose=False -> 'close' (quote)
     Ritorna pandas.Series indicizzata da datetime naive, name=ticker.
-    Se fallisce o non trova dati -> None.
     """
     start_sec = int((start.tz_localize("UTC") - pd.Timedelta(days=3)).timestamp())
     end_sec   = int((end.tz_localize("UTC") + pd.Timedelta(days=1)).timestamp())
 
-    cache_key = (ticker, str(start_sec), str(end_sec))
+    kind = "adj" if use_adjclose else "close"
+    cache_key = (ticker, str(start_sec), str(end_sec), kind)
     if cache_key in _price_cache:
         return _price_cache[cache_key].copy()
 
@@ -303,12 +306,20 @@ def download_price_history_yahoo(ticker: str,
         return None
     res0 = result_list[0]
     ts = res0.get("timestamp", [])
-    adj = res0.get("indicators", {}).get("adjclose", [{}])[0].get("adjclose", [])
-    if not ts or not adj:
+    ind = res0.get("indicators", {}) or {}
+    adj = (ind.get("adjclose", [{}])[0] or {}).get("adjclose", [])
+    quo = (ind.get("quote",   [{}])[0] or {}).get("close",    [])
+
+    if use_adjclose:
+        series_vals = adj
+    else:
+        series_vals = quo if quo else adj  # fallback ad adj se close mancante
+
+    if not ts or not series_vals:
         return None
 
     idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert(None)
-    s = pd.Series(adj, index=idx, name=ticker, dtype=float).dropna()
+    s = pd.Series(series_vals, index=idx, name=ticker, dtype=float).dropna()
     if s.empty:
         return None
 
@@ -318,17 +329,16 @@ def download_price_history_yahoo(ticker: str,
 
 def robust_fetch_prices_for_symbol(sym: str,
                                    first_tx_date: pd.Timestamp,
-                                   start_buffer_days: int = 7) -> pd.Series | None:
+                                   start_buffer_days: int,
+                                   use_adjclose: bool) -> pd.Series | None:
     """
-    Prova a scaricare i prezzi per sym provando suffissi comuni,
-    usando la fetch Yahoo custom.
-    Ritorna Series (Adjusted Close) o None.
+    Prova a scaricare i prezzi per sym provando suffissi comuni.
     """
     start = first_tx_date - timedelta(days=start_buffer_days)
     end = pd.Timestamp(datetime.today().date())
 
     for ticker_try in [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]:
-        ser = download_price_history_yahoo(ticker_try, start, end)
+        ser = download_price_history_yahoo(ticker_try, start, end, use_adjclose=use_adjclose)
         if ser is not None and not ser.empty:
             return ser.rename(sym)
         time.sleep(0.1)
@@ -339,9 +349,6 @@ def robust_fetch_prices_for_symbol(sym: str,
 # ALLOCAZIONI ETF (STUB SU RENDER)
 ###############################################################################
 def get_etf_allocations(ticker: str):
-    """
-    Stub per Render: ritorna DataFrame vuoti.
-    """
     return (
         pd.DataFrame(columns=["label", "weight"]),
         pd.DataFrame(columns=["label", "weight"]),
@@ -352,11 +359,6 @@ def aggregate_allocations_portfolio(shares_df: pd.DataFrame,
                                     prices_df: pd.DataFrame,
                                     tickers: list[str],
                                     bench: str):
-    """
-    Somma pesata delle allocazioni degli ETF.
-    Qui ritorniamo DataFrame vuoti perché su Render non possiamo ancora
-    fare scraping con browser headless.
-    """
     return (
         pd.DataFrame(columns=["label", "weight_portfolio"]),
         pd.DataFrame(columns=["label", "weight_portfolio"]),
@@ -364,21 +366,17 @@ def aggregate_allocations_portfolio(shares_df: pd.DataFrame,
 
 
 ###############################################################################
-# ANALISI PORTAFOGLIO COMPLETA (TWR, PME, IRR, SHARPE, VaR, GRAFICO)
+# ANALISI PORTAFOGLIO COMPLETA
 ###############################################################################
 def analyze_portfolio_from_text(lots_text: str,
                                 bench: str,
                                 outdir: str = "/tmp/outputs",
-                                start_buffer_days: int = 7):
+                                start_buffer_days: int = 7,
+                                use_adjclose: bool = False):
     """
-    Passi:
-      - parse lotti
-      - scarica prezzi robusti per TUTTI i ticker + benchmark (Yahoo raw)
-      - costruisce NAV portafoglio, TWR base 100
-      - costruisce benchmark base 100 (fallback al portafoglio se indisponibile)
-      - calcola PME, IRR, Sharpe 12m, VaR(95%) 1d
-      - salva grafico e summary
-      - ritorna dict pronto per JSON
+    Allinea il comportamento allo script locale:
+    - di default use_adjclose=False (usa 'Close')
+    - e sostituisce il prezzo del giorno-trade con il prezzo immesso nel file (px_file)
     """
 
     os.makedirs(outdir, exist_ok=True)
@@ -393,7 +391,7 @@ def analyze_portfolio_from_text(lots_text: str,
     # 2) scarica prezzi
     price_series = {}
     for sym in all_tickers:
-        s = robust_fetch_prices_for_symbol(sym, first_tx_date, start_buffer_days)
+        s = robust_fetch_prices_for_symbol(sym, first_tx_date, start_buffer_days, use_adjclose=use_adjclose)
         if s is not None and not s.empty:
             price_series[sym] = s.astype(float)
         time.sleep(0.1)
@@ -409,40 +407,51 @@ def analyze_portfolio_from_text(lots_text: str,
     px = to_naive(px).asfreq("B").ffill()
     px = px.loc[px.index >= (first_tx_date - timedelta(days=start_buffer_days))]
 
-    # 3) ricostruisci shares giornaliere
+    # 3) ricostruisci shares + crea px_eff = px e sovrascrivi il prezzo del giorno-trade
     present = sorted(set(px.columns) & set(tickers_portafoglio))
     shares = pd.DataFrame(0.0, index=px.index, columns=present)
+
+    # px_eff = prezzi usati per la valutazione del portafoglio (con override del trade-day se use_adjclose=False)
+    px_eff = px.copy()
 
     trades = []
     for _, r in lots.iterrows():
         sym = r["ticker"]
         d = r["data"]
-        qty = float(r["quantità"])   # può essere negativa (vendite)
-        px_file = float(r["prezzo"]) # prezzo immesso dall'utente, usato per i cash flow
+        qty = float(r["quantità"])
+        px_file = float(r["prezzo"])
 
+        # mappiamo alla prima data di mercato >= d
         pos = px.index.searchsorted(d, side="left")
         if pos >= len(px.index):
-            # trade fuori range (dopo l'ultima data di mercato scaricata)
             continue
         d_eff = px.index[pos]
 
+        # salva trade
         trades.append((sym, d, d_eff, qty, px_file))
 
+        # accumula quantità dal giorno effettivo
         if sym in shares.columns:
-            # aggiorna posizione dal giorno effettivo in avanti
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-    # 4) valore portafoglio giornaliero
-    port_val = (shares * px[present]).sum(axis=1)
+        # *** COMPORTAMENTO LOCALE ***
+        # Se NON usiamo AdjClose, usiamo 'Close' e SOSTITUIAMO il prezzo
+        # del giorno-trade con quello del file (px_file) per la valutazione.
+        if not use_adjclose and (sym in px_eff.columns) and (d_eff in px_eff.index):
+            try:
+                px_eff.at[d_eff, sym] = float(px_file)
+            except Exception:
+                pass
 
-    # tieni solo da quando il portafoglio ha valore > 0
+    # 4) valore portafoglio giornaliero (usando px_eff)
+    port_val = (shares * px_eff[present]).sum(axis=1)
     first_mv_mask = port_val > 0
     if not first_mv_mask.any():
         raise RuntimeError("Portafoglio senza valore positivo (controlla i lotti).")
     first_mv_date = first_mv_mask.idxmax()
     port_val = port_val.loc[first_mv_date:].dropna()
 
-    # 5) benchmark value series
+    # 5) benchmark value series (sempre dai prezzi 'px' reali)
     if bench in px.columns:
         bench_val_raw = px[bench].dropna()
         bench_name = bench
@@ -450,7 +459,7 @@ def analyze_portfolio_from_text(lots_text: str,
         bench_val_raw = port_val.copy()
         bench_name = "PORTFOLIO"
 
-    # allinea su intersezione date
+    # allinea date
     idx_common = port_val.index.intersection(bench_val_raw.index)
     port_val = port_val.loc[idx_common]
     bench_val = bench_val_raw.loc[idx_common]
@@ -462,7 +471,9 @@ def analyze_portfolio_from_text(lots_text: str,
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file in trades:
         if d_eff in cf.index:
-            cf.loc[d_eff] += qty * px_file
+            # nel locale, il flusso usa px_eff_trade: qui è px_file quando use_adjclose=False
+            invest_today = px_file if not use_adjclose else float(px.loc[d_eff, sym])
+            cf.loc[d_eff] += qty * invest_today
 
     # 7) TWR base 100
     dates = port_val.index
@@ -575,11 +586,12 @@ def analyze_portfolio_from_text(lots_text: str,
     )
 
     # 13) Grafico cumulato
+    mode_label = "AdjClose (ignora prezzo file)" if use_adjclose else "Close (usa prezzo file al trade day)"
     plot_path = os.path.join(outdir, "crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
     plt.plot(port_idx, label="Portafoglio (TWR base 100)")
     plt.plot(bench_idx, label=f"Benchmark {bench_name} (base 100)")
-    plt.title(f"Andamento storico (base 100)\n{rf_meta}")
+    plt.title(f"Andamento storico (base 100)\nMode: {mode_label} | {rf_meta}")
     plt.ylabel("Indice (base 100)")
     plt.grid(True)
     plt.legend()
@@ -590,7 +602,7 @@ def analyze_portfolio_from_text(lots_text: str,
     # 14) Allocazioni (stub lato Render)
     sectors_p, countries_p = aggregate_allocations_portfolio(
         shares_df=shares[present],
-        prices_df=px,
+        prices_df=px_eff,   # coerenza con la valutazione portafoglio
         tickers=present,
         bench=bench_name,
     )
