@@ -28,7 +28,7 @@ def to_date(s: str) -> pd.Timestamp:
     s = str(s).strip()
     dt = pd.to_datetime(s, errors="coerce")
     if pd.isna(dt):
-        # tentativo dayfirst (eventuale)
+        # tenta dayfirst
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if pd.isna(dt):
         raise ValueError(f"Data non riconosciuta: {s}")
@@ -69,6 +69,29 @@ def xirr(cf):
 
 # ---------------- Input lots ----------------
 
+def _to_float_robust(val: str) -> float:
+    """
+    Converte stringhe come:
+      ' 270 ', '77,9683', '77.9683', '1 234,56', '1 234.56', '1.234,56'
+    rimuovendo whitespace/nbspace e caratteri spurî.
+    """
+    s = str(val)
+    # rimuovi NBSP e whitespace unicode
+    s = s.replace("\u00A0", "").replace("\u202F", "")
+    s = re.sub(r"\s+", "", s)
+    # normalizza virgola -> punto
+    s = s.replace(",", ".")
+    # tieni solo cifre, punto e segno meno
+    s = re.sub(r"[^0-9\.\-]", "", s)
+    # se ci sono troppi punti (es. '1.234.567.89'): tieni il primo come separatore decimale
+    if s.count(".") > 1:
+        head, tail = s.split(".", 1)
+        tail = tail.replace(".", "")
+        s = f"{head}.{tail}"
+    if s in ("", ".", "-", "-.", ".-"):
+        raise ValueError(f"Stringa numerica vuota/non valida: '{val}'")
+    return float(s)
+
 def read_lots_from_text(txt: str) -> pd.DataFrame:
     """
     Accetta righe tipo:
@@ -87,8 +110,8 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
         ticker = parts[0].strip().upper()
         data = to_date(parts[1])
         try:
-            qty = float(str(parts[2]).replace(" ", "").replace(",", "."))
-            px  = float(str(parts[3]).replace(" ", "").replace(",", "."))
+            qty = _to_float_robust(parts[2])    # gestisce anche quantità negative (vendite)
+            px  = _to_float_robust(parts[3])
         except Exception:
             raise ValueError(f"Quantità o prezzo non valido: '{ln}'")
         rows.append((ticker, data, qty, px))
@@ -201,7 +224,7 @@ def analyze_portfolio_from_text(
         if pos >= len(calendar):
             continue
         d_eff = calendar[pos]
-        # se use_adjclose True, usiamo prezzo storico (AdjClose); altrimenti prezzo del file nel giorno d_eff
+        # se use_adjclose True, usiamo prezzo storico; altrimenti prezzo del file nel giorno d_eff
         px_eff_trade = float(px.loc[d_eff, sym]) if use_adjclose else px_file
         trades.append((sym, d, d_eff, qty, px_file, px_eff_trade))
 
@@ -248,7 +271,7 @@ def analyze_portfolio_from_text(
     # RF
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
-    # PME (replica dei flussi sul benchmark)
+    # PME
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -280,7 +303,7 @@ def analyze_portfolio_from_text(
     sharpe_bench_12m = np.nan
     if not bench_r_12m.empty and bench_r_12m.std(ddof=1) > 0:
         exb = bench_r_12m - rf_12m_b
-        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / ex.std(ddof=1))
+        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))  # <-- fix: exb
     sigma_1d_b = float(bench_r_12m.std(ddof=1)) if not bench_r_12m.empty else np.nan
     current_value_bench_pme = float(bench_pme_val.iloc[-1])
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
@@ -307,6 +330,7 @@ def analyze_portfolio_from_text(
     irr_excess = (irr_port - irr_bench) if (np.isfinite(irr_port) and np.isfinite(irr_bench)) else np.nan
 
     # Grafico
+    os.makedirs(outdir, exist_ok=True)
     plot_path = os.path.join(outdir, "crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
     plt.plot(port_idx, label="Portafoglio (TWR, base 100)")
