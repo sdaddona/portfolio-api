@@ -6,80 +6,36 @@ from flask import Flask, request, jsonify, send_file, make_response
 
 from portfolio_core import run_full_analysis
 
-# ------------------------------------------------------------------------------
-# Setup Flask app + logging
-# ------------------------------------------------------------------------------
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("portfolio-api")
 
-# ------------------------------------------------------------------------------
-# CORS CONFIG
-# ------------------------------------------------------------------------------
-# In produzione puoi mettere: ALLOWED_ORIGINS = {"https://www.daddona.it", "https://daddona.it"}
-ALLOWED_ORIGINS = {"*"}  # per ora aperto
-
-ALLOWED_HEADERS = "Content-Type, Accept, X-Requested-With"
-ALLOWED_METHODS = "GET,POST,OPTIONS"
-
-
-def _pick_origin(req_origin: str | None) -> str:
-    """Se vuoi restringere, restituisce l'origin solo se ammesso, altrimenti 'null'."""
-    if not req_origin:
-        return "*"
-    if "*" in ALLOWED_ORIGINS:
-        return "*"
-    return req_origin if req_origin in ALLOWED_ORIGINS else "null"
-
+# CORS (puoi restringere a "https://www.daddona.it" quando sei pronto)
+ALLOWED_ORIGINS = "*"
 
 def add_cors_headers(resp):
-    """Aggiunge header CORS standard alla risposta Flask."""
-    origin = _pick_origin(request.headers.get("Origin"))
-    resp.headers["Access-Control-Allow-Origin"] = origin
-    resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Methods"] = ALLOWED_METHODS
-    resp.headers["Access-Control-Allow-Headers"] = ALLOWED_HEADERS
-    # niente credenziali (cookies) -> non necessario per questa API
+    resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGINS
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
-
 
 @app.after_request
 def after_request(response):
-    """
-    Questo viene chiamato su OGNI risposta "normale".
-    Aggiungiamo qui gli header CORS in modo automatico.
-    """
     return add_cors_headers(response)
 
-# ------------------------------------------------------------------------------
-# HEALTHCHECK /
-# ------------------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def root():
     payload = {
         "status": "ok",
         "message": "portfolio API online",
-        "time_utc": datetime.utcnow().isoformat() + "Z",
+        "time_utc": datetime.utcnow().isoformat() + "Z"
     }
     resp = jsonify(payload)
     return add_cors_headers(resp)
 
-# ------------------------------------------------------------------------------
-# /analyze
-# ------------------------------------------------------------------------------
 @app.route("/analyze", methods=["POST", "OPTIONS"])
 def analyze():
-    """
-    POST /analyze
-    Body JSON:
-      {
-        "lots_text": "ACWI 2012-12-21 200 47.81\n...",
-        "bench": "VT",
-        "use_adjclose": false   # opzionale
-      }
-    """
-    # Preflight CORS
     if request.method == "OPTIONS":
         resp = make_response("", 204)
         return add_cors_headers(resp)
@@ -90,9 +46,12 @@ def analyze():
             resp = jsonify({"ok": False, "error": "Body JSON mancante o non valido"})
             return add_cors_headers(resp), 400
 
-        lots_text = (data.get("lots_text") or "").strip()
-        bench = (data.get("bench") or "").strip()
-        use_adjclose = bool(data.get("use_adjclose", False))
+        lots_text   = (data.get("lots_text") or "").strip()
+        bench       = (data.get("bench") or "").strip()
+        # —— nuovi parametri per replicare il locale ——
+        use_adjclose = bool(data.get("use_adjclose", False))   # locale: False
+        rf_source    = (data.get("rf_source") or "fred_1y").strip().lower()
+        rf_fixed     = float(data.get("rf_fixed", 0.04))
 
         if not lots_text:
             resp = jsonify({"ok": False, "error": "lots_text mancante"})
@@ -101,15 +60,18 @@ def analyze():
             resp = jsonify({"ok": False, "error": "bench mancante"})
             return add_cors_headers(resp), 400
 
-        logger.info("Analyze called | bench=%s | use_adjclose=%s | chars(lots)=%d",
-                    bench, use_adjclose, len(lots_text))
+        logger.info(
+            "Analyze called | bench=%s | use_adjclose=%s | rf_source=%s | rf_fixed=%s | chars(lots)=%d",
+            bench, use_adjclose, rf_source, rf_fixed, len(lots_text)
+        )
 
-        # Supporto opzionale a use_adjclose: se la tua funzione non lo accetta, fallback.
-        try:
-            result = run_full_analysis(lots_text, bench, use_adjclose=use_adjclose)
-        except TypeError:
-            # vecchia firma (lots_text, bench)
-            result = run_full_analysis(lots_text, bench)
+        result = run_full_analysis(
+            lots_text=lots_text,
+            bench=bench,
+            use_adjclose=use_adjclose,
+            rf_source=rf_source,
+            rf_fixed=rf_fixed,
+        )
 
         out = {"ok": True, **result}
         resp = jsonify(out)
@@ -120,20 +82,12 @@ def analyze():
         resp = jsonify({
             "ok": False,
             "error": str(e),
-            "trace": traceback.format_exc(),
+            "trace": traceback.format_exc()
         })
         return add_cors_headers(resp), 500
 
-# ------------------------------------------------------------------------------
-# /plot
-# ------------------------------------------------------------------------------
 @app.route("/plot", methods=["GET", "OPTIONS"])
 def get_plot():
-    """
-    Ritorna il PNG dell’ultima analisi.
-    <img src="https://portfolio-api-docker.onrender.com/plot" />
-    """
-    # Preflight CORS
     if request.method == "OPTIONS":
         resp = make_response("", 204)
         return add_cors_headers(resp)
@@ -144,20 +98,18 @@ def get_plot():
             resp = jsonify({"ok": False, "error": "Plot non disponibile. Esegui prima /analyze."})
             return add_cors_headers(resp), 404
 
-        resp = make_response(send_file(plot_path, mimetype="image/png", as_attachment=False))
-        # evita cache aggressive del browser/CDN
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        resp.headers["Pragma"] = "no-cache"
+        resp = send_file(plot_path, mimetype="image/png", as_attachment=False)
         return add_cors_headers(resp), 200
 
     except Exception as e:
         logger.exception("Errore in /plot")
-        resp = jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()})
+        resp = jsonify({
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc()
+        })
         return add_cors_headers(resp), 500
 
-# ------------------------------------------------------------------------------
-# RUN LOCALE
-# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
