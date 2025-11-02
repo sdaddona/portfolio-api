@@ -42,20 +42,27 @@ def analyze():
     try:
         data = request.get_json(silent=True)
         if data is None:
-            return add_cors_headers(jsonify({"ok": False, "error": "Body JSON mancante o non valido"})), 400
+            resp = jsonify({"ok": False, "error": "Body JSON mancante o non valido"})
+            return add_cors_headers(resp), 400
 
-        lots_text   = data.get("lots_text", "")
-        bench       = data.get("bench", "")
+        lots_text = data.get("lots_text", "")
+        bench = data.get("bench", "")
         use_adjclose = bool(data.get("use_adjclose", False))
-        rf_source    = str(data.get("rf_source", "fred_1y"))
-        rf           = float(data.get("rf", 0.04))
+        rf_source = str(data.get("rf_source", "fred_1y"))
+        rf = float(data.get("rf", 0.0))
+        start_buffer_days = int(data.get("start_buffer_days", 7))
 
         if not lots_text.strip():
-            return add_cors_headers(jsonify({"ok": False, "error": "lots_text mancante"})), 400
+            resp = jsonify({"ok": False, "error": "lots_text mancante"})
+            return add_cors_headers(resp), 400
         if not bench.strip():
-            return add_cors_headers(jsonify({"ok": False, "error": "bench mancante"})), 400
+            resp = jsonify({"ok": False, "error": "bench mancante"})
+            return add_cors_headers(resp), 400
 
-        logger.info(f"Analyze called | bench={bench} | use_adjclose={use_adjclose} | rf_source={rf_source} | rf={rf} | chars(lots)={len(lots_text)}")
+        logger.info(
+            "Analyze called | bench=%s | use_adjclose=%s | rf_source=%s | rf=%.4f | chars(lots)=%d",
+            bench, use_adjclose, rf_source, rf, len(lots_text)
+        )
 
         result = run_full_analysis(
             lots_text=lots_text,
@@ -63,14 +70,15 @@ def analyze():
             use_adjclose=use_adjclose,
             rf_source=rf_source,
             rf=rf,
+            start_buffer_days=start_buffer_days,
         )
 
         resp = jsonify({"ok": True, **result})
         return add_cors_headers(resp), 200
 
     except Exception as e:
-        logger.error("Errore in /analyze")
-        resp = jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()})
+        logger.exception("Errore in /analyze")
+        resp = jsonify({"ok": False, "error": str(e)})
         return add_cors_headers(resp), 500
 
 @app.route("/plot", methods=["GET", "OPTIONS"])
