@@ -1,8 +1,0 @@
-services:
-  - type: web
-    name: portfolio-analyzer
-    runtime: docker
-    plan: free
-    envVars:
-      - key: FRED_API_KEY
-        value: ""

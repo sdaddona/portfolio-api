@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: portfolio-analyzer
+    runtime: docker
+    plan: free
+    envVars:
+      - key: FRED_API_KEY
+        value: ""
+      - key: EOD_API_KEY
+        sync: false    # così la imposti dall'interfaccia senza committare la chiave
+      - key: PYTHONUNBUFFERED
+        value: "1"
+    healthCheckPath: /
+    autoDeploy: true
