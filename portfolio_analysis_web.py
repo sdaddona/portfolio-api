@@ -6,6 +6,8 @@ import re
 import io
 import json
 import time
+import math
+import random
 import warnings
 from io import StringIO
 from datetime import datetime, timedelta
@@ -25,7 +27,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 TRADING_DAYS = 252
 
 # ======================================================================
-#  YFINANCE: sessione + backoff + cache locale per aggirare errori 429
+#  YFINANCE: sessione + backoff + cache locale + DOWNLOAD BATCH
 # ======================================================================
 import requests
 from requests.adapters import HTTPAdapter, Retry
@@ -40,7 +42,7 @@ def _make_yf_session():
         )
     })
     retries = Retry(
-        total=2,                # lascio basso qui: il vero backoff lo gestiamo noi
+        total=2,
         backoff_factor=0.2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "HEAD", "OPTIONS"]
@@ -75,23 +77,19 @@ def _load_cache(sym: str) -> pd.DataFrame | None:
             return None
     return None
 
+def _sleep_jitter(base: float):
+    time.sleep(base + random.uniform(0, 0.6))
+
 def _yf_download_one(sym: str, start=None, end=None, auto_adjust=False) -> pd.DataFrame:
-    """
-    Scarica prezzi per un singolo simbolo con backoff progressivo e
-    fallback multipli. Se tutti i tentativi falliscono, prova dal cache.
-    Ritorna DataFrame stile yfinance (colonne: Open High Low Close Adj Close Volume).
-    """
-    # Strategia A: finestra temporale esplicita
+    """Singolo simbolo, con backoff + fallback + cache."""
     plans = [
         {"kwargs": {"start": start, "end": end, "interval": "1d", "auto_adjust": auto_adjust}},
         {"kwargs": {"period": "5y", "interval": "1d", "auto_adjust": auto_adjust}},
         {"kwargs": {"period": "1mo", "interval": "1d", "auto_adjust": auto_adjust}},
     ]
-
-    backoff = [2, 4, 8, 16, 24]  # secondi
+    backoff = [2, 4, 8, 16, 24]
     for plan in plans:
-        tries = 0
-        while tries < len(backoff):
+        for delay in backoff:
             try:
                 df = yf.download(
                     sym,
@@ -101,28 +99,110 @@ def _yf_download_one(sym: str, start=None, end=None, auto_adjust=False) -> pd.Da
                     **plan["kwargs"]
                 )
                 if isinstance(df, pd.DataFrame) and not df.empty:
-                    # Yahoo a volte restituisce colonna 'Close' singola come Series: normalizziamo
                     if "Close" not in df.columns and isinstance(df, pd.Series):
                         df = df.to_frame("Close")
                     _save_cache(sym, df)
                     return df
-            except Exception as e:
-                # se 429/5xx: aspetta ed esegui retry
-                # non sempre l'eccezione espone status_code; facciamo backoff comunque
+            except Exception:
                 pass
-            time.sleep(backoff[tries])
-            tries += 1
-
-    # Fallback: cache locale
+            _sleep_jitter(delay)
     cached = _load_cache(sym)
     if cached is not None and not cached.empty:
         return cached
-
-    # Se ancora nulla, ritorna DataFrame vuoto
     return pd.DataFrame()
 
+def _extract_close_from_multi(df_multi: pd.DataFrame, symbols: List[str]) -> Dict[str, pd.Series]:
+    """Estrae la colonna Close per ciascun simbolo da un DataFrame multi-colonne di yf.download(batch)."""
+    out = {}
+    if df_multi is None or df_multi.empty:
+        return out
+    # yf per molti ticker restituisce colonne MultiIndex: (campo, ticker) oppure (ticker, campo)
+    cols = df_multi.columns
+    # Normalizziamo i casi più comuni
+    if isinstance(cols, pd.MultiIndex):
+        # Identifichiamo livello che contiene 'Close'
+        close_level = None
+        for lvl in range(cols.nlevels):
+            if any((str(x).lower() == "close") for x in cols.get_level_values(lvl)):
+                close_level = lvl
+                break
+        if close_level is None:
+            return out
+        for sym in symbols:
+            try:
+                if close_level == 0:
+                    s = df_multi[("Close", sym)]
+                else:
+                    s = df_multi[(sym, "Close")]
+                s = s.rename(sym).dropna().sort_index()
+                if not s.empty:
+                    out[sym] = s
+            except Exception:
+                continue
+    else:
+        # Caso singolo: df ha le colonne OHLC
+        if "Close" in df_multi.columns and len(symbols) == 1:
+            s = df_multi["Close"].rename(symbols[0]).dropna().sort_index()
+            if not s.empty:
+                out[symbols[0]] = s
+    return out
+
+def _yf_download_batch(symbols: List[str], start=None, end=None, auto_adjust=False, chunk_size: int = 20) -> Dict[str, pd.Series]:
+    """
+    Scarica in BATCH per ridurre i 429. Ritorna dict {sym: Close Series}.
+    Fa backoff su ciascun chunk; se qualche simbolo manca, si prova in singolo con _yf_download_one.
+    """
+    symbols = [s for s in symbols if s]  # no vuoti
+    all_series: Dict[str, pd.Series] = {}
+
+    if not symbols:
+        return all_series
+
+    # Chunking per non esagerare
+    chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
+    for chunk in chunks:
+        # Tentativi con backoff sull'intero chunk
+        backoff = [2, 4, 8, 16]
+        got = {}
+        for delay in backoff:
+            try:
+                df = yf.download(
+                    " ".join(chunk),
+                    start=start, end=end,
+                    interval="1d",
+                    auto_adjust=auto_adjust,
+                    progress=False,
+                    group_by="ticker",
+                    session=YF_SESSION,
+                    threads=False,
+                )
+                got = _extract_close_from_multi(df, chunk)
+                # Salva cache per ciò che abbiamo preso
+                for sym, ser in got.items():
+                    if not ser.empty:
+                        # ricostruiamo un DF stile yfinance minimal per cache
+                        _save_cache(sym, ser.to_frame("Close"))
+                break
+            except Exception:
+                pass
+            _sleep_jitter(delay)
+
+        # Se qualche simbolo manca, prova singolarmente (con cache)
+        missing = [s for s in chunk if s not in got]
+        for sym in missing:
+            one = _yf_download_one(sym, start=start, end=end, auto_adjust=auto_adjust)
+            if one is not None and not one.empty and "Close" in one.columns:
+                got[sym] = one["Close"].rename(sym).sort_index()
+
+        all_series.update(got)
+
+        # respiro fra chunk per non farsi limitare
+        _sleep_jitter(1.0)
+
+    return all_series
+
 # =============================================================================
-# ----------------------- UTIL -----------------------
+# ----------------------- UTIL (calcoli identici alla tua versione) ----------
 # =============================================================================
 
 def to_naive(obj):
@@ -144,18 +224,6 @@ def to_date(s: str) -> pd.Timestamp:
         return dt.tz_localize(None)
     except Exception:
         return dt
-
-def try_symbol(sym: str) -> str:
-    """
-    Risoluzione simbolo: proviamo vari suffissi usando _yf_download_one,
-    poi memorizziamo il primo che dà dati non vuoti.
-    """
-    candidates = [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]
-    for t in candidates:
-        df = _yf_download_one(t, start=datetime.today()-timedelta(days=35), end=datetime.today()+timedelta(days=2))
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return t
-    return ""
 
 def xnpv(r, cf):
     t0 = cf[0][0]
@@ -184,9 +252,8 @@ def map_to_effective_date(d: pd.Timestamp, idx: pd.DatetimeIndex) -> pd.Timestam
         return None
     return idx[pos]
 
-
 # =============================================================================
-# ----------------------- LETTURA LOTTI (da testo) -----------------------
+# ----------------------- LETTURA LOTTI (da testo) ---------------------------
 # =============================================================================
 
 def read_lots_from_text(txt: str) -> pd.DataFrame:
@@ -243,9 +310,8 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
     df["data"] = df["data"].apply(to_date)
     return df.sort_values("data").reset_index(drop=True)
 
-
 # =============================================================================
-# ----------------------- RISK-FREE -----------------------
+# ----------------------- RISK-FREE ------------------------------------------
 # =============================================================================
 
 def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: float):
@@ -288,9 +354,8 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
         rf_daily = pd.Series(0.0, index=index)
         return rf_daily, "RF fallback 0.00% (FRED DGS1 download failed)"
 
-
 # =============================================================================
-# ----------------------- ANALISI (da testo) -----------------------
+# ----------------------- ANALISI (da testo) ---------------------------------
 # =============================================================================
 
 def analyze_portfolio_from_text(
@@ -303,8 +368,8 @@ def analyze_portfolio_from_text(
     start_buffer_days: int = 7,
 ):
     """
-    Identico alla tua versione locale nei calcoli.
-    Differenze solo nel download (backoff, cache).
+    Calcoli IDENTICI alla versione locale.
+    Cambia solo il download: batch+cache per evitare i 429 su Render.
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -315,38 +380,43 @@ def analyze_portfolio_from_text(
     if not bench:
         raise ValueError("Benchmark mancante.")
 
-    # RISOLUZIONE TICKER
+    # LISTA TICKER (senza suffissi .US/.L/.MI per evitare hit inutili)
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
-    resolved: Dict[str, str] = {}
-    for s in tickers:
-        rs = try_symbol(s)
-        resolved[s] = rs
 
-    if not resolved.get(bench):
-        raise RuntimeError(f"Benchmark {bench} non risolto su Yahoo")
-
-    # PREZZI
+    # PREZZI (BATCH)
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
-    series = {}
-    for k, y in resolved.items():
-        if not y:
-            continue
-        h = _yf_download_one(
-            y, start=start, end=end,
-            auto_adjust=True if use_adjclose else False
-        )
-        if h is None or h.empty or "Close" not in h.columns:
-            continue
-        s_close = h["Close"].rename(k).sort_index().ffill()
-        series[k] = to_naive(s_close)
-        # piccolo respiro fra simboli per ridurre ulteriormente i 429
-        time.sleep(0.25)
 
-    if not series:
+    series_map = _yf_download_batch(
+        symbols=tickers,
+        start=start, end=end,
+        auto_adjust=True if use_adjclose else False,
+        chunk_size=18
+    )
+
+    # Verifica e fallback singoli
+    for sym in tickers:
+        if sym not in series_map or series_map[sym] is None or series_map[sym].empty:
+            one = _yf_download_one(
+                sym, start=start, end=end,
+                auto_adjust=True if use_adjclose else False
+            )
+            if one is not None and not one.empty and "Close" in one.columns:
+                series_map[sym] = one["Close"].rename(sym).sort_index()
+            else:
+                # fallback cache
+                cached = _load_cache(sym)
+                if cached is not None and not cached.empty and "Close" in cached.columns:
+                    series_map[sym] = cached["Close"].rename(sym).sort_index()
+
+    # Filtra solo quelli davvero presenti
+    present_syms = [s for s in tickers if s in series_map and isinstance(series_map[s], pd.Series) and not series_map[s].empty]
+    if not present_syms or bench not in present_syms:
         raise RuntimeError(f"Nessun prezzo disponibile per: {tickers}")
 
-    px = pd.concat(series.values(), axis=1).sort_index().ffill()
+    px = pd.concat([series_map[s] for s in present_syms], axis=1)
+    px.columns = present_syms
+    px = px.sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
 
     # COSTRUZIONE POSIZIONI
@@ -478,7 +548,7 @@ def analyze_portfolio_from_text(
         pass
     plt.close()
 
-    # SUMMARY (testo)
+    # SUMMARY
     contrib = cf.clip(upper=0) * -1.0
     withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
