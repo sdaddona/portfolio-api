@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")  # headless su Render
 import matplotlib.pyplot as plt
 
 import yfinance as yf
@@ -24,9 +24,9 @@ from pandas_datareader import data as pdr  # FRED
 warnings.filterwarnings("ignore", category=UserWarning)
 TRADING_DAYS = 252
 
-# ----------------------------------------------------------------------
-# yfinance hardened session (fix per Render / blocchi CDN)
-# ----------------------------------------------------------------------
+# ======================================================================
+#  YFINANCE: sessione + backoff + cache locale per aggirare errori 429
+# ======================================================================
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
@@ -40,8 +40,8 @@ def _make_yf_session():
         )
     })
     retries = Retry(
-        total=3,
-        backoff_factor=0.6,
+        total=2,                # lascio basso qui: il vero backoff lo gestiamo noi
+        backoff_factor=0.2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "HEAD", "OPTIONS"]
     )
@@ -50,7 +50,76 @@ def _make_yf_session():
     return s
 
 YF_SESSION = _make_yf_session()
+CACHE_DIR = "/tmp/yf_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
 
+def _cache_path(sym: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sym)
+    return os.path.join(CACHE_DIR, f"{safe}.csv")
+
+def _save_cache(sym: str, df: pd.DataFrame):
+    try:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df.to_csv(_cache_path(sym))
+    except Exception:
+        pass
+
+def _load_cache(sym: str) -> pd.DataFrame | None:
+    p = _cache_path(sym)
+    if os.path.exists(p):
+        try:
+            df = pd.read_csv(p, index_col=0, parse_dates=True)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception:
+            return None
+    return None
+
+def _yf_download_one(sym: str, start=None, end=None, auto_adjust=False) -> pd.DataFrame:
+    """
+    Scarica prezzi per un singolo simbolo con backoff progressivo e
+    fallback multipli. Se tutti i tentativi falliscono, prova dal cache.
+    Ritorna DataFrame stile yfinance (colonne: Open High Low Close Adj Close Volume).
+    """
+    # Strategia A: finestra temporale esplicita
+    plans = [
+        {"kwargs": {"start": start, "end": end, "interval": "1d", "auto_adjust": auto_adjust}},
+        {"kwargs": {"period": "5y", "interval": "1d", "auto_adjust": auto_adjust}},
+        {"kwargs": {"period": "1mo", "interval": "1d", "auto_adjust": auto_adjust}},
+    ]
+
+    backoff = [2, 4, 8, 16, 24]  # secondi
+    for plan in plans:
+        tries = 0
+        while tries < len(backoff):
+            try:
+                df = yf.download(
+                    sym,
+                    progress=False,
+                    session=YF_SESSION,
+                    threads=False,
+                    **plan["kwargs"]
+                )
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    # Yahoo a volte restituisce colonna 'Close' singola come Series: normalizziamo
+                    if "Close" not in df.columns and isinstance(df, pd.Series):
+                        df = df.to_frame("Close")
+                    _save_cache(sym, df)
+                    return df
+            except Exception as e:
+                # se 429/5xx: aspetta ed esegui retry
+                # non sempre l'eccezione espone status_code; facciamo backoff comunque
+                pass
+            time.sleep(backoff[tries])
+            tries += 1
+
+    # Fallback: cache locale
+    cached = _load_cache(sym)
+    if cached is not None and not cached.empty:
+        return cached
+
+    # Se ancora nulla, ritorna DataFrame vuoto
+    return pd.DataFrame()
 
 # =============================================================================
 # ----------------------- UTIL -----------------------
@@ -78,22 +147,14 @@ def to_date(s: str) -> pd.Timestamp:
 
 def try_symbol(sym: str) -> str:
     """
-    Risolvi ticker su Yahoo con suffissi comuni.
-    Evitiamo .history(period='10d') (spesso bloccato su PaaS) e usiamo yf.download
-    con sessione custom e threads=False.
+    Risoluzione simbolo: proviamo vari suffissi usando _yf_download_one,
+    poi memorizziamo il primo che dà dati non vuoti.
     """
     candidates = [sym, f"{sym}.US", f"{sym}.L", f"{sym}.MI"]
     for t in candidates:
-        try:
-            df = yf.download(
-                t, period="1mo", interval="1d",
-                auto_adjust=False, progress=False,
-                session=YF_SESSION, threads=False
-            )
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return t
-        except Exception:
-            pass
+        df = _yf_download_one(t, start=datetime.today()-timedelta(days=35), end=datetime.today()+timedelta(days=2))
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return t
     return ""
 
 def xnpv(r, cf):
@@ -129,12 +190,6 @@ def map_to_effective_date(d: pd.Timestamp, idx: pd.DatetimeIndex) -> pd.Timestam
 # =============================================================================
 
 def read_lots_from_text(txt: str) -> pd.DataFrame:
-    """
-    Accetta contenuto incollato (textarea WordPress).
-    Supporta separatori: tab, ; , oppure spazi multipli.
-    Riconosce header opzionali (ticker/data/quantità/prezzo).
-    Consente decimali con virgola, vendite (quantità negative).
-    """
     if txt is None:
         raise ValueError("lots_text mancante.")
     lines = [ln for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
@@ -180,7 +235,7 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
             name_map[c] = posmap[i]
     df = df.rename(columns=name_map)[["ticker", "data", "quantità", "prezzo"]]
 
-    def to_float(x): 
+    def to_float(x):
         return float(str(x).strip().replace(" ", "").replace(",", "."))
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
     df["quantità"] = df["quantità"].apply(to_float)
@@ -204,15 +259,11 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
     if rf_source == "irx_13w":
         tkr = "^IRX"
         try:
-            h = yf.download(
+            h = _yf_download_one(
                 tkr,
                 start=index[0]-pd.Timedelta(days=10),
                 end=index[-1]+pd.Timedelta(days=3),
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                session=YF_SESSION,
-                threads=False
+                auto_adjust=False
             )
             ser = h["Close"].rename("IRX").sort_index()
             ser = to_naive(ser).reindex(index).ffill()
@@ -252,14 +303,8 @@ def analyze_portfolio_from_text(
     start_buffer_days: int = 7,
 ):
     """
-    Riproduce la logica locale:
-      - parse lotti
-      - risolve ticker su Yahoo (try_symbol con sessione custom)
-      - download prezzi via yf.download(session=..., threads=False)
-      - costruisce px_eff (override prezzo al trade-day se NON use_adjclose)
-      - TWR base 100, PME, IRR, Sharpe/Vol/Var
-      - salva grafico come /tmp/outputs/crescita_cumulata.png
-      - ritorna dict JSON-safe
+    Identico alla tua versione locale nei calcoli.
+    Differenze solo nel download (backoff, cache).
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -280,39 +325,23 @@ def analyze_portfolio_from_text(
     if not resolved.get(bench):
         raise RuntimeError(f"Benchmark {bench} non risolto su Yahoo")
 
-    # PREZZI (download robusto)
+    # PREZZI
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
     series = {}
     for k, y in resolved.items():
         if not y:
             continue
-        h = yf.download(
-            y,
-            start=start, end=end, interval="1d",
-            auto_adjust=True if use_adjclose else False,
-            progress=False, session=YF_SESSION, threads=False
+        h = _yf_download_one(
+            y, start=start, end=end,
+            auto_adjust=True if use_adjclose else False
         )
         if h is None or h.empty or "Close" not in h.columns:
-            # tenta un fallback “period”
-            h = yf.download(
-                y, period="5y", interval="1d",
-                auto_adjust=True if use_adjclose else False,
-                progress=False, session=YF_SESSION, threads=False
-            )
-        if h is None or h.empty or "Close" not in h.columns:
-            # ultimo tentativo “1mo”
-            h = yf.download(
-                y, period="1mo", interval="1d",
-                auto_adjust=True if use_adjclose else False,
-                progress=False, session=YF_SESSION, threads=False
-            )
-        if h is None or h.empty or "Close" not in h.columns:
             continue
-
         s_close = h["Close"].rename(k).sort_index().ffill()
         series[k] = to_naive(s_close)
-        time.sleep(0.05)
+        # piccolo respiro fra simboli per ridurre ulteriormente i 429
+        time.sleep(0.25)
 
     if not series:
         raise RuntimeError(f"Nessun prezzo disponibile per: {tickers}")
@@ -336,7 +365,7 @@ def analyze_portfolio_from_text(
 
     px_eff = px.copy()
     if not use_adjclose:
-        # override del prezzo nel giorno del trade con il prezzo del file (come locale)
+        # override del prezzo nel giorno del trade con il prezzo del file
         for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
             if sym in px_eff.columns and d_eff in px_eff.index:
                 px_eff.at[d_eff, sym] = px_file
@@ -363,7 +392,7 @@ def analyze_portfolio_from_text(
     port_val = port_val.loc[idx_common]
     bench_val = bench_val.loc[idx_common]
 
-    # CASH FLOWS (usa px_eff_trade, come locale)
+    # CASH FLOWS
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if d_eff in cf.index:
@@ -381,7 +410,7 @@ def analyze_portfolio_from_text(
     port_idx = (1 + twr_ret).cumprod() * 100.0
     port_idx = pd.concat([pd.Series([100.0], index=dates[:1]), port_idx])
 
-    # Benchmark base 100 (prezzi)
+    # Benchmark base 100
     bench_ret = bench_val.pct_change()
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
@@ -389,7 +418,7 @@ def analyze_portfolio_from_text(
     # RF daily
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
-    # PME (replica flussi sul benchmark)
+    # PME
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -424,15 +453,14 @@ def analyze_portfolio_from_text(
     sharpe_bench_12m = np.nan
     if not bench_r_12m.empty and bench_r_12m.std(ddof=1) > 0:
         exb = bench_r_12m - rf_12m_b
-        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / ex.std(ddof=1))
-
+        sharpe_bench_12m = float(np.sqrt(TRADING_DAYS) * exb.mean() / exb.std(ddof=1))
     sigma_1d_b = float(bench_r_12m.std(ddof=1)) if not bench_r_12m.empty else np.nan
     current_value_bench_pme = float(bench_pme_val.iloc[-1])
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
-    # GRAFICO
-    out_hist_main = os.path.join(outdir, "crescita_cumulata.png")   # usato da /plot
+    # GRAFICO (compatibile col tuo /plot)
+    out_hist_main = os.path.join(outdir, "crescita_cumulata.png")
     out_hist_copy = os.path.join(outdir, "01_crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
     plt.plot(port_idx, label="Portafoglio (TWR, base 100)")
@@ -450,7 +478,7 @@ def analyze_portfolio_from_text(
         pass
     plt.close()
 
-    # SUMMARY (come versione locale)
+    # SUMMARY (testo)
     contrib = cf.clip(upper=0) * -1.0
     withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
@@ -502,7 +530,6 @@ def analyze_portfolio_from_text(
     for k, v in rows:
         summary_lines.append(f"{k.ljust(45)} {v}")
 
-    # ritorno (allocazioni per ora vuote, come richiesto)
     out = {
         "summary_lines": summary_lines,
         "plot_path": out_hist_main,
@@ -536,7 +563,6 @@ def analyze_portfolio_from_text(
         },
     }
 
-    # salva summary.txt per completezza
     with open(out["summary_path"], "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
