@@ -3,71 +3,46 @@
 
 import os
 import re
-import io
-import json
 import time
-import math
 import random
 import warnings
 from io import StringIO
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 import matplotlib
-matplotlib.use("Agg")  # headless su Render
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
 import yfinance as yf
-from pandas_datareader import data as pdr  # FRED
+from pandas_datareader import data as pdr  # FRED + STOOQ
 
 warnings.filterwarnings("ignore", category=UserWarning)
 TRADING_DAYS = 252
 
-# ======================================================================
-#  YFINANCE: sessione + backoff + cache locale + DOWNLOAD BATCH
-# ======================================================================
-import requests
-from requests.adapters import HTTPAdapter, Retry
-
-def _make_yf_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    })
-    retries = Retry(
-        total=2,
-        backoff_factor=0.2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD", "OPTIONS"]
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.mount("http://", HTTPAdapter(max_retries=retries))
-    return s
-
-YF_SESSION = _make_yf_session()
+# --------------------------- Cache locale ----------------------------
 CACHE_DIR = "/tmp/yf_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-def _cache_path(sym: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", sym)
+def _cache_path(sym: str, src: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{src}_{sym}")
     return os.path.join(CACHE_DIR, f"{safe}.csv")
 
-def _save_cache(sym: str, df: pd.DataFrame):
+def _save_cache(sym: str, df: pd.DataFrame, src: str):
     try:
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df.to_csv(_cache_path(sym))
+        if isinstance(df, (pd.DataFrame, pd.Series)) and not df.empty:
+            if isinstance(df, pd.Series):
+                df.to_frame("Close").to_csv(_cache_path(sym, src))
+            else:
+                df.to_csv(_cache_path(sym, src))
     except Exception:
         pass
 
-def _load_cache(sym: str) -> pd.DataFrame | None:
-    p = _cache_path(sym)
+def _load_cache(sym: str, src: str) -> pd.DataFrame | None:
+    p = _cache_path(sym, src)
     if os.path.exists(p):
         try:
             df = pd.read_csv(p, index_col=0, parse_dates=True)
@@ -78,133 +53,9 @@ def _load_cache(sym: str) -> pd.DataFrame | None:
     return None
 
 def _sleep_jitter(base: float):
-    time.sleep(base + random.uniform(0, 0.6))
+    time.sleep(base + random.uniform(0, 0.5))
 
-def _yf_download_one(sym: str, start=None, end=None, auto_adjust=False) -> pd.DataFrame:
-    """Singolo simbolo, con backoff + fallback + cache."""
-    plans = [
-        {"kwargs": {"start": start, "end": end, "interval": "1d", "auto_adjust": auto_adjust}},
-        {"kwargs": {"period": "5y", "interval": "1d", "auto_adjust": auto_adjust}},
-        {"kwargs": {"period": "1mo", "interval": "1d", "auto_adjust": auto_adjust}},
-    ]
-    backoff = [2, 4, 8, 16, 24]
-    for plan in plans:
-        for delay in backoff:
-            try:
-                df = yf.download(
-                    sym,
-                    progress=False,
-                    session=YF_SESSION,
-                    threads=False,
-                    **plan["kwargs"]
-                )
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    if "Close" not in df.columns and isinstance(df, pd.Series):
-                        df = df.to_frame("Close")
-                    _save_cache(sym, df)
-                    return df
-            except Exception:
-                pass
-            _sleep_jitter(delay)
-    cached = _load_cache(sym)
-    if cached is not None and not cached.empty:
-        return cached
-    return pd.DataFrame()
-
-def _extract_close_from_multi(df_multi: pd.DataFrame, symbols: List[str]) -> Dict[str, pd.Series]:
-    """Estrae la colonna Close per ciascun simbolo da un DataFrame multi-colonne di yf.download(batch)."""
-    out = {}
-    if df_multi is None or df_multi.empty:
-        return out
-    # yf per molti ticker restituisce colonne MultiIndex: (campo, ticker) oppure (ticker, campo)
-    cols = df_multi.columns
-    # Normalizziamo i casi più comuni
-    if isinstance(cols, pd.MultiIndex):
-        # Identifichiamo livello che contiene 'Close'
-        close_level = None
-        for lvl in range(cols.nlevels):
-            if any((str(x).lower() == "close") for x in cols.get_level_values(lvl)):
-                close_level = lvl
-                break
-        if close_level is None:
-            return out
-        for sym in symbols:
-            try:
-                if close_level == 0:
-                    s = df_multi[("Close", sym)]
-                else:
-                    s = df_multi[(sym, "Close")]
-                s = s.rename(sym).dropna().sort_index()
-                if not s.empty:
-                    out[sym] = s
-            except Exception:
-                continue
-    else:
-        # Caso singolo: df ha le colonne OHLC
-        if "Close" in df_multi.columns and len(symbols) == 1:
-            s = df_multi["Close"].rename(symbols[0]).dropna().sort_index()
-            if not s.empty:
-                out[symbols[0]] = s
-    return out
-
-def _yf_download_batch(symbols: List[str], start=None, end=None, auto_adjust=False, chunk_size: int = 20) -> Dict[str, pd.Series]:
-    """
-    Scarica in BATCH per ridurre i 429. Ritorna dict {sym: Close Series}.
-    Fa backoff su ciascun chunk; se qualche simbolo manca, si prova in singolo con _yf_download_one.
-    """
-    symbols = [s for s in symbols if s]  # no vuoti
-    all_series: Dict[str, pd.Series] = {}
-
-    if not symbols:
-        return all_series
-
-    # Chunking per non esagerare
-    chunks = [symbols[i:i+chunk_size] for i in range(0, len(symbols), chunk_size)]
-    for chunk in chunks:
-        # Tentativi con backoff sull'intero chunk
-        backoff = [2, 4, 8, 16]
-        got = {}
-        for delay in backoff:
-            try:
-                df = yf.download(
-                    " ".join(chunk),
-                    start=start, end=end,
-                    interval="1d",
-                    auto_adjust=auto_adjust,
-                    progress=False,
-                    group_by="ticker",
-                    session=YF_SESSION,
-                    threads=False,
-                )
-                got = _extract_close_from_multi(df, chunk)
-                # Salva cache per ciò che abbiamo preso
-                for sym, ser in got.items():
-                    if not ser.empty:
-                        # ricostruiamo un DF stile yfinance minimal per cache
-                        _save_cache(sym, ser.to_frame("Close"))
-                break
-            except Exception:
-                pass
-            _sleep_jitter(delay)
-
-        # Se qualche simbolo manca, prova singolarmente (con cache)
-        missing = [s for s in chunk if s not in got]
-        for sym in missing:
-            one = _yf_download_one(sym, start=start, end=end, auto_adjust=auto_adjust)
-            if one is not None and not one.empty and "Close" in one.columns:
-                got[sym] = one["Close"].rename(sym).sort_index()
-
-        all_series.update(got)
-
-        # respiro fra chunk per non farsi limitare
-        _sleep_jitter(1.0)
-
-    return all_series
-
-# =============================================================================
-# ----------------------- UTIL (calcoli identici alla tua versione) ----------
-# =============================================================================
-
+# --------------------------- Util calcoli ----------------------------
 def to_naive(obj):
     if isinstance(obj, (pd.Series, pd.DataFrame)) and isinstance(obj.index, pd.DatetimeIndex):
         try:
@@ -252,10 +103,7 @@ def map_to_effective_date(d: pd.Timestamp, idx: pd.DatetimeIndex) -> pd.Timestam
         return None
     return idx[pos]
 
-# =============================================================================
-# ----------------------- LETTURA LOTTI (da testo) ---------------------------
-# =============================================================================
-
+# --------------------------- Lettura lotti ---------------------------
 def read_lots_from_text(txt: str) -> pd.DataFrame:
     if txt is None:
         raise ValueError("lots_text mancante.")
@@ -310,10 +158,7 @@ def read_lots_from_text(txt: str) -> pd.DataFrame:
     df["data"] = df["data"].apply(to_date)
     return df.sort_values("data").reset_index(drop=True)
 
-# =============================================================================
-# ----------------------- RISK-FREE ------------------------------------------
-# =============================================================================
-
+# --------------------------- Risk-free ---------------------------
 def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: float):
     rf_source = (rf_source or "fred_1y").lower()
 
@@ -325,13 +170,14 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
     if rf_source == "irx_13w":
         tkr = "^IRX"
         try:
-            h = _yf_download_one(
-                tkr,
-                start=index[0]-pd.Timedelta(days=10),
-                end=index[-1]+pd.Timedelta(days=3),
-                auto_adjust=False
-            )
-            ser = h["Close"].rename("IRX").sort_index()
+            # ^IRX via Yahoo singolo, con cache
+            df = _load_cache(tkr, "yahoo")
+            if df is None or df.empty:
+                h = yf.Ticker(tkr).history(period="10y", interval="1d", auto_adjust=False, threads=False)
+                if h is not None and not h.empty:
+                    df = h[["Close"]]
+                    _save_cache(tkr, df, "yahoo")
+            ser = df["Close"].rename("IRX").sort_index()
             ser = to_naive(ser).reindex(index).ffill()
             rf_annual = ser / 100.0
             rf_daily = rf_annual / TRADING_DAYS
@@ -341,7 +187,7 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
             rf_daily = pd.Series(0.0, index=index)
             return rf_daily, "RF fallback 0.00% (IRX download failed)"
 
-    # default: FRED DGS1 (1-Year Treasury)
+    # default: FRED DGS1
     try:
         fred = pdr.DataReader("DGS1", "fred", index[0]-pd.Timedelta(days=10), index[-1]+pd.Timedelta(days=3))
         ser = fred["DGS1"].rename("DGS1").sort_index()
@@ -354,10 +200,73 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
         rf_daily = pd.Series(0.0, index=index)
         return rf_daily, "RF fallback 0.00% (FRED DGS1 download failed)"
 
-# =============================================================================
-# ----------------------- ANALISI (da testo) ---------------------------------
-# =============================================================================
+# --------------------------- Downloader: STOOQ → cache → Yahoo ---------------------------
+def _stooq_try(sym: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    """
+    Tenta Stooq con 'sym' e, se vuoto, con 'sym.US'.
+    Stooq fornisce prezzi *adjusted* nel campo 'Close'. Ordiniamo asc.
+    """
+    for variant in (sym, f"{sym}.US"):
+        try:
+            df = pdr.DataReader(variant, "stooq", start, end)  # può tornare desc
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df = df.sort_index()
+                s = df["Close"].rename(sym).dropna()
+                if not s.empty:
+                    _save_cache(sym, s, "stooq")
+                    return s
+        except Exception:
+            continue
+    # cache Stooq
+    cached = _load_cache(sym, "stooq")
+    if cached is not None and not cached.empty and "Close" in cached.columns:
+        return cached["Close"].rename(sym).sort_index()
+    return pd.Series(dtype=float)
 
+def _yahoo_try(sym: str, start: pd.Timestamp, end: pd.Timestamp, auto_adjust: bool) -> pd.Series:
+    """Tentativo Yahoo finale (singolo), con backoff dolce e cache."""
+    back = [1.5, 3.0, 6.0]
+    for delay in back:
+        try:
+            h = yf.download(sym, start=start, end=end, interval="1d",
+                            auto_adjust=auto_adjust, progress=False, threads=False)
+            if isinstance(h, pd.DataFrame) and not h.empty and "Close" in h.columns:
+                s = h["Close"].rename(sym).sort_index()
+                if not s.empty:
+                    _save_cache(sym, s, "yahoo")
+                    return s
+        except Exception:
+            pass
+        _sleep_jitter(delay)
+    cached = _load_cache(sym, "yahoo")
+    if cached is not None and not cached.empty and "Close" in cached.columns:
+        return cached["Close"].rename(sym).sort_index()
+    return pd.Series(dtype=float)
+
+def _download_prices(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, auto_adjust: bool) -> Dict[str, pd.Series]:
+    """
+    Strategia cloud-friendly:
+      1) Stooq (sym, sym.US)
+      2) Cache (Stooq / Yahoo)
+      3) Yahoo (ultimissimo tentativo singolo)
+    """
+    out: Dict[str, pd.Series] = {}
+    for sym in symbols:
+        sym = sym.upper().strip()
+        if not sym:
+            continue
+        # 1) Stooq
+        s = _stooq_try(sym, start, end)
+        if s is not None and not s.empty:
+            out[sym] = s
+            continue
+        # 2) Yahoo (solo se Stooq non ha nulla)
+        s2 = _yahoo_try(sym, start, end, auto_adjust=auto_adjust)
+        if s2 is not None and not s2.empty:
+            out[sym] = s2
+    return out
+
+# --------------------------- Analisi principale ---------------------------
 def analyze_portfolio_from_text(
     lots_text: str,
     bench: str,
@@ -368,8 +277,8 @@ def analyze_portfolio_from_text(
     start_buffer_days: int = 7,
 ):
     """
-    Calcoli IDENTICI alla versione locale.
-    Cambia solo il download: batch+cache per evitare i 429 su Render.
+    Calcoli IDENTICI alla tua versione locale.
+    Cambia solo l’approvvigionamento dati: Stooq→Cache→Yahoo, per eliminare i 429 su Render.
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -380,36 +289,15 @@ def analyze_portfolio_from_text(
     if not bench:
         raise ValueError("Benchmark mancante.")
 
-    # LISTA TICKER (senza suffissi .US/.L/.MI per evitare hit inutili)
+    # LISTA TICKER
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
 
-    # PREZZI (BATCH)
+    # PREZZI
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
 
-    series_map = _yf_download_batch(
-        symbols=tickers,
-        start=start, end=end,
-        auto_adjust=True if use_adjclose else False,
-        chunk_size=18
-    )
+    series_map = _download_prices(tickers, start, end, auto_adjust=True if use_adjclose else False)
 
-    # Verifica e fallback singoli
-    for sym in tickers:
-        if sym not in series_map or series_map[sym] is None or series_map[sym].empty:
-            one = _yf_download_one(
-                sym, start=start, end=end,
-                auto_adjust=True if use_adjclose else False
-            )
-            if one is not None and not one.empty and "Close" in one.columns:
-                series_map[sym] = one["Close"].rename(sym).sort_index()
-            else:
-                # fallback cache
-                cached = _load_cache(sym)
-                if cached is not None and not cached.empty and "Close" in cached.columns:
-                    series_map[sym] = cached["Close"].rename(sym).sort_index()
-
-    # Filtra solo quelli davvero presenti
     present_syms = [s for s in tickers if s in series_map and isinstance(series_map[s], pd.Series) and not series_map[s].empty]
     if not present_syms or bench not in present_syms:
         raise RuntimeError(f"Nessun prezzo disponibile per: {tickers}")
@@ -435,7 +323,7 @@ def analyze_portfolio_from_text(
 
     px_eff = px.copy()
     if not use_adjclose:
-        # override del prezzo nel giorno del trade con il prezzo del file
+        # override del prezzo nel giorno del trade con il prezzo del file (identico alla tua logica)
         for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
             if sym in px_eff.columns and d_eff in px_eff.index:
                 px_eff.at[d_eff, sym] = px_file
@@ -488,7 +376,7 @@ def analyze_portfolio_from_text(
     # RF daily
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
-    # PME
+    # PME (replica flussi sul benchmark)
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -530,6 +418,7 @@ def analyze_portfolio_from_text(
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
     # GRAFICO (compatibile col tuo /plot)
+    os.makedirs(outdir, exist_ok=True)
     out_hist_main = os.path.join(outdir, "crescita_cumulata.png")
     out_hist_copy = os.path.join(outdir, "01_crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
@@ -554,6 +443,7 @@ def analyze_portfolio_from_text(
     gross_contrib = float(contrib.sum())
     gross_withdrw = float(withdrw.sum())
     net_invested = float(cf.sum())
+    current_value_port = float(port_val.iloc[-1])
     current_value_pme = float(bench_pme_val.iloc[-1])
 
     r_net_port = (current_value_port / net_invested - 1) if net_invested > 0 else np.nan
@@ -569,7 +459,6 @@ def analyze_portfolio_from_text(
 
     def fmt_pct(x):
         return "n/a" if (x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x)))) else f"{x:.2%}"
-
     def money(x): return f"{x:,.2f} USD"
 
     summary_lines = []
