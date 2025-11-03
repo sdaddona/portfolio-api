@@ -345,7 +345,7 @@ def download_price_series(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_
     return s
 
 # -----------------------------------------------------------------------------
-# Analisi principale
+# Analisi principale (identica al locale, con fix per partire dal primo trade)
 # -----------------------------------------------------------------------------
 
 def analyze_portfolio_from_text(
@@ -381,31 +381,10 @@ def analyze_portfolio_from_text(
     if bench not in series or series[bench].empty:
         raise RuntimeError(f"Benchmark {bench} non disponibile su alcuna fonte. Impossibile calcolare PME.")
 
-    # Tolleranza storia per i ticker “early”
-    first_trade_by_sym = lots.groupby("ticker")["data"].min().to_dict()
-    tolerance_days = start_buffer_days + 5  # tolleranza realistica
-    short_history: List[str] = []
-
-    # Solo i ticker che partono alla data minima globale “devono” avere storia già lì;
-    # per gli altri va bene che inizino quando compaiono nei lotti.
-    global_first = first_tx_date
-
-    for sym, sym_first_trade in first_trade_by_sym.items():
-        s = series.get(sym)
-        if s is None or s.empty:
-            # mancante del tutto: lo segniamo, ma NON blocchiamo (il px_file copre il trade-day)
-            short_history.append(sym)
-            continue
-        s_start = pd.Timestamp(s.index.min().date())
-        # Se questo ticker è tra quelli al minimo globale, richiediamo solo che la prima quotazione
-        # non sia oltre la tolleranza rispetto al suo primo trade.
-        if sym_first_trade == global_first:
-            if s_start > (sym_first_trade + pd.Timedelta(days=tolerance_days)):
-                short_history.append(sym)
-
-    # Matrice prezzi
+    # Matrice prezzi e FIX: bfill iniziale per evitare 0×NaN -> NaN prima del primo prezzo
     px = pd.concat(series.values(), axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
+    px = px.bfill()  # <=== FIX decisivo: riempie la testa con il primo prezzo disponibile
 
     # COSTRUZIONE POSIZIONI
     calendar = px.index
@@ -423,6 +402,7 @@ def analyze_portfolio_from_text(
 
     px_eff = px.copy()
     if not use_adjclose:
+        # sovrascrivi il prezzo nel giorno del trade con il prezzo del file (come nel locale)
         for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
             if sym in px_eff.columns and d_eff in px_eff.index:
                 px_eff.at[d_eff, sym] = px_file
@@ -437,11 +417,12 @@ def analyze_portfolio_from_text(
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
     # VALORI
+    # NB: ora 0 * prezzo_definito = 0 (niente NaN) anche prima del primo prezzo originale
     port_val = (shares * px_eff[present]).sum(axis=1)
-    first_mv = port_val[port_val > 0].first_valid_index()
+    first_mv = port_val[port_val > 0].first_valid_index()  # prima operazione reale
     port_val = port_val.loc[first_mv:].dropna()
 
-    # Benchmark riallineato al calendario del portafoglio (parte dalla prima operazione)
+    # Benchmark riallineato SIN DALLA PRIMA OPERAZIONE del portafoglio
     bench_raw = px[bench].copy()
     bench_val = bench_raw.reindex(port_val.index).bfill().ffill()
 
@@ -601,7 +582,7 @@ def analyze_portfolio_from_text(
             "irr_bench": irr_bench,
             "irr_excess": irr_excess,
             "current_value_port": current_value_port,
-            "current_value_bench_pme": current_value_bench_pme,
+            "current_value_bench_pme": float(bench_pme_val.iloc[-1]),
             "net_invested": float(cf.sum()),
         },
         "meta": {
@@ -609,6 +590,5 @@ def analyze_portfolio_from_text(
             "rf_meta": rf_meta,
             "bench": bench,
             "start_first_trade": str(first_tx_date.date()),
-            "short_history": sorted(short_history),  # solo informativo
         },
     }
