@@ -14,22 +14,23 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-# Matplotlib headless
+# Headless plotting
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Opzionali (fallback finale): yfinance può essere rate-limited in cloud
+# Optional deps (gestiti con try per ambienti cloud)
 try:
     import yfinance as yf
 except Exception:
     yf = None
 
-# FRED via pandas-datareader (solo per risk-free)
 try:
-    from pandas_datareader import data as pdr
+    from pandas_datareader import data as pdr  # FRED
 except Exception:
     pdr = None
+
+import requests  # per Stooq/EODHD
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -38,9 +39,9 @@ OUTDIR_DEFAULT = "/tmp/outputs"
 CACHE_DIR = "/tmp/price_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Utils
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def to_naive(obj):
     if isinstance(obj, (pd.Series, pd.DataFrame)) and isinstance(obj.index, pd.DatetimeIndex):
@@ -102,9 +103,9 @@ def _fmt_pct(x: float) -> str:
         return "n/a"
     return f"{x:.2%}"
 
-# =============================================================================
-# Parsing lotti da testo
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Parsing lotti (da testo)
+# -----------------------------------------------------------------------------
 
 def read_lots_from_text(lots_text: str) -> pd.DataFrame:
     if lots_text is None:
@@ -115,7 +116,7 @@ def read_lots_from_text(lots_text: str) -> pd.DataFrame:
     sample = "\n".join(lines)
 
     def _try(buf, header=None):
-        # separatori: spazi multipli, tab, virgole, punto e virgola
+        # separatori: più spazi, tab, virgole, punto e virgola
         return pd.read_csv(buf, sep=r"[,\t;]+|\s{2,}", engine="python", header=header, comment="#")
 
     buf = StringIO(sample)
@@ -151,19 +152,73 @@ def read_lots_from_text(lots_text: str) -> pd.DataFrame:
             name_map[c] = "prezzo"
         else:
             name_map[c] = posmap[i]
+
     df = df.rename(columns=name_map)[["ticker", "data", "quantità", "prezzo"]]
 
     def to_float(x):
         return float(str(x).strip().replace(" ", "").replace(",", "."))
+
     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
     df["quantità"] = df["quantità"].apply(to_float)
     df["prezzo"] = df["prezzo"].apply(to_float)
     df["data"] = df["data"].apply(to_date)
     return df.sort_values("data").reset_index(drop=True)
 
-# =============================================================================
-# Cache helpers
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Risk-free
+# -----------------------------------------------------------------------------
+
+def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: float):
+    rf_source = (rf_source or "fred_1y").lower()
+
+    if rf_source == "fixed":
+        rf_daily = pd.Series(rf_fixed / TRADING_DAYS, index=index)
+        rf_meta = f"Fixed RF {rf_fixed:.2%} (ann.)"
+        return rf_daily, rf_meta
+
+    if rf_source == "irx_13w":
+        # Yahoo ^IRX se disponibile
+        s = None
+        if yf is not None:
+            try:
+                h = yf.Ticker("^IRX").history(
+                    start=index[0] - pd.Timedelta(days=10),
+                    end=index[-1] + pd.Timedelta(days=3),
+                    interval="1d",
+                    auto_adjust=False,
+                )
+                if h is not None and not h.empty and "Close" in h.columns:
+                    s = h["Close"].rename("IRX").sort_index()
+            except Exception:
+                s = None
+        if s is not None and not s.empty:
+            s = to_naive(s).reindex(index).ffill()
+            rf_annual = s / 100.0
+            rf_daily = rf_annual / TRADING_DAYS
+            return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
+
+        # fallback
+        rf_daily = pd.Series(0.0, index=index)
+        return rf_daily, "RF fallback 0.00% (IRX download failed)"
+
+    # default: FRED DGS1
+    if pdr is not None:
+        try:
+            fred = pdr.DataReader("DGS1", "fred", index[0] - pd.Timedelta(days=10), index[-1] + pd.Timedelta(days=3))
+            ser = fred["DGS1"].rename("DGS1").sort_index()
+            ser = ser.reindex(index).ffill()
+            rf_annual = ser / 100.0
+            rf_daily = rf_annual / TRADING_DAYS
+            return rf_daily, "RF: FRED DGS1 (1Y Treasury, ann.)"
+        except Exception:
+            pass
+
+    rf_daily = pd.Series(0.0, index=index)
+    return rf_daily, "RF fallback 0.00% (FRED DGS1 download failed)"
+
+# -----------------------------------------------------------------------------
+# Downloader prezzi (multi-sorgente con cache e “period=max”)
+# -----------------------------------------------------------------------------
 
 _STQ_SUFFIXES = ["", ".US", ".L", ".MI"]
 
@@ -190,12 +245,7 @@ def _save_cache(sym: str, start, end, adj: bool, s: pd.Series):
     except Exception:
         pass
 
-# =============================================================================
-# Download prezzi (Stooq → EODHD → Yahoo)
-# =============================================================================
-
 def _download_stooq(sym: str, start: pd.Timestamp, end: pd.Timestamp) -> Optional[pd.Series]:
-    import requests
     for suff in _STQ_SUFFIXES:
         url = f"https://stooq.com/q/d/l/?s={sym.lower()}{suff.lower()}&i=d"
         try:
@@ -221,7 +271,6 @@ def _download_eodhd(sym: str, start: pd.Timestamp, end: pd.Timestamp) -> Optiona
     api_key = os.environ.get("EOD_API_KEY", "").strip()
     if not api_key:
         return None
-    import requests
     for suff in ["", ".US", ".LSE", ".MI"]:
         url = (
             f"https://eodhistoricaldata.com/api/eod/{sym}{suff}"
@@ -246,37 +295,55 @@ def _download_eodhd(sym: str, start: pd.Timestamp, end: pd.Timestamp) -> Optiona
             continue
     return None
 
-def _download_yahoo(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool) -> Optional[pd.Series]:
+def _download_yahoo(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool, use_period_max: bool = False) -> Optional[pd.Series]:
     if yf is None:
         return None
     for suff in ["", ".US", ".L", ".MI"]:
         ysym = f"{sym}{suff}"
         try:
-            h = yf.Ticker(ysym).history(
-                start=start - pd.Timedelta(days=2),
-                end=end + pd.Timedelta(days=2),
-                interval="1d",
-                auto_adjust=True if adj else False,
-            )
+            if use_period_max:
+                h = yf.Ticker(ysym).history(
+                    period="max",
+                    interval="1d",
+                    auto_adjust=True if adj else False,
+                )
+            else:
+                h = yf.Ticker(ysym).history(
+                    start=start - pd.Timedelta(days=2),
+                    end=end + pd.Timedelta(days=2),
+                    interval="1d",
+                    auto_adjust=True if adj else False,
+                )
             col = "Close"
             if h is None or h.empty or col not in h.columns:
                 continue
             s = h[col].rename(sym.upper()).sort_index().ffill()
+            if use_period_max:
+                s = s[(s.index >= pd.Timestamp(start.date())) & (s.index <= pd.Timestamp(end.date()))]
             return to_naive(s)
         except Exception:
             continue
     return None
 
 def download_price_series(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Optional[pd.Series]:
+    # cache
     cached = _load_cache(sym, start, end, use_adjclose)
     if cached is not None and not cached.empty:
         return cached
 
+    # primo pass: Stooq -> EODHD -> Yahoo (finestra richiesta)
     s = _download_stooq(sym, start, end)
     if s is None or s.empty:
         s = _download_eodhd(sym, start, end)
     if (s is None or s.empty) and yf is not None:
-        s = _download_yahoo(sym, start, end, use_adjclose)
+        s = _download_yahoo(sym, start, end, use_adjclose, use_period_max=False)
+
+    # se la serie parte dopo la prima operazione o è assente, secondo pass "max"
+    need_second_pass = (s is None or s.empty) or (s.index.min() > pd.Timestamp(start.date()))
+    if need_second_pass and yf is not None:
+        s2 = _download_yahoo(sym, start, end, use_adjclose, use_period_max=True)
+        if s2 is not None and not s2.empty:
+            s = s2
 
     if s is None or s.empty:
         return None
@@ -286,55 +353,9 @@ def download_price_series(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_
     time.sleep(0.35)  # rate limit gentile
     return s
 
-# =============================================================================
-# Risk-free
-# =============================================================================
-
-def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: float):
-    rf_source = (rf_source or "fred_1y").lower()
-
-    if rf_source == "fixed":
-        rf_daily = pd.Series(rf_fixed / TRADING_DAYS, index=index)
-        rf_meta = f"Fixed RF {rf_fixed:.2%} (ann.)"
-        return rf_daily, rf_meta
-
-    if rf_source == "irx_13w":
-        s = None
-        if yf is not None:
-            try:
-                h = yf.Ticker("^IRX").history(
-                    start=index[0] - pd.Timedelta(days=10),
-                    end=index[-1] + pd.Timedelta(days=3),
-                    interval="1d",
-                    auto_adjust=False,
-                )
-                if h is not None and not h.empty and "Close" in h.columns:
-                    s = h["Close"].rename("IRX").sort_index()
-            except Exception:
-                s = None
-        if s is not None and not s.empty:
-            s = to_naive(s).reindex(index).ffill()
-            rf_annual = s / 100.0
-            rf_daily = rf_annual / TRADING_DAYS
-            return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
-        return pd.Series(0.0, index=index), "RF fallback 0.00% (IRX download failed)"
-
-    # default FRED DGS1
-    if pdr is not None:
-        try:
-            fred = pdr.DataReader("DGS1", "fred", index[0]-pd.Timedelta(days=10), index[-1]+pd.Timedelta(days=3))
-            ser = fred["DGS1"].rename("DGS1").sort_index()
-            ser = ser.reindex(index).ffill()
-            rf_annual = ser / 100.0
-            rf_daily = rf_annual / TRADING_DAYS
-            return rf_daily, "RF: FRED DGS1 (1Y Treasury, ann.)"
-        except Exception:
-            pass
-    return pd.Series(0.0, index=index), "RF fallback 0.00% (FRED DGS1 download failed)"
-
-# =============================================================================
-# Analisi principale (identica alla locale, con fix benchmark)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Analisi principale (identica al locale, con controlli storia)
+# -----------------------------------------------------------------------------
 
 def analyze_portfolio_from_text(
     lots_text: str,
@@ -347,38 +368,68 @@ def analyze_portfolio_from_text(
 ) -> Dict:
     os.makedirs(outdir, exist_ok=True)
 
-    # LOTTI
+    # --- LOTTI
     lots = read_lots_from_text(lots_text)
     first_tx_date = lots["data"].min()
     bench = (bench or "VT").upper()
 
-    # TICKER
+    # --- TICKER LIST
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
 
-    # PREZZI
+    # --- Finestra prezzi
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
 
+    # --- Primo pass download
     series: Dict[str, pd.Series] = {}
     for sym in tickers:
         s = download_price_series(sym, start, end, use_adjclose)
         if s is not None and not s.empty:
-            s = s.rename(sym).sort_index().ffill()
-            series[sym] = to_naive(s)
+            series[sym] = s.rename(sym).sort_index().ffill()
 
-    # Se manca il bench, riprova separatamente
-    if bench not in series:
-        sb = download_price_series(bench, start, end, use_adjclose)
-        if sb is not None and not sb.empty:
-            series[bench] = sb.rename(bench)
+    # --- Secondo pass per assicurare storia dalla prima operazione
+    first_trade_by_sym = lots.groupby("ticker")["data"].min().to_dict()
+    missing_or_short: List[str] = []
+    for sym in tickers:
+        first_trade = first_trade_by_sym.get(sym)
+        if first_trade is None:
+            continue
+        s = series.get(sym)
+        if (s is None) or s.empty:
+            missing_or_short.append(sym)
+        else:
+            s_start = pd.Timestamp(s.index.min().date())
+            if s_start > pd.Timestamp(first_trade.date()):
+                missing_or_short.append(sym)
 
-    if not series or bench not in series:
-        raise RuntimeError(f"Nessun prezzo disponibile per: {sorted(tickers)}")
+    if missing_or_short:
+        for sym in missing_or_short:
+            s2 = download_price_series(sym, start, end, use_adjclose)
+            if s2 is not None and not s2.empty:
+                series[sym] = s2.rename(sym).sort_index().ffill()
 
+    # --- Verifiche dure: benchmark e early trades
+    if bench not in series or series[bench].empty:
+        raise RuntimeError(f"Benchmark {bench} non disponibile su alcuna fonte. Impossibile calcolare PME.")
+
+    early_trades = [sym for sym, d0 in first_trade_by_sym.items() if d0 <= first_tx_date]
+    if early_trades:
+        early_missing = [
+            sym for sym in early_trades
+            if (sym not in series) or series[sym].empty
+            or (pd.Timestamp(series[sym].index.min().date()) > pd.Timestamp(first_trade_by_sym[sym].date()))
+        ]
+        if early_missing:
+            raise RuntimeError(
+                "Storico insufficiente per partire dalla prima operazione. "
+                f"Ticker con storia mancante o troppo corta: {sorted(set(early_missing))}."
+            )
+
+    # --- Costruisci matrice prezzi
     px = pd.concat(series.values(), axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
 
-    # COSTRUZIONE POSIZIONI
+    # --- COSTRUZIONE POSIZIONI (come locale)
     calendar = px.index
     trades = []
     for _, r in lots.iterrows():
@@ -394,7 +445,7 @@ def analyze_portfolio_from_text(
 
     px_eff = px.copy()
     if not use_adjclose:
-        # Usa il prezzo del file nel giorno del trade (identico alla locale)
+        # usa il prezzo del file nel giorno trade (identico al locale)
         for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
             if sym in px_eff.columns and d_eff in px_eff.index:
                 px_eff.at[d_eff, sym] = px_file
@@ -408,22 +459,22 @@ def analyze_portfolio_from_text(
         if pos < len(shares.index):
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-    # VALORI
+    # --- VALORI portafoglio e benchmark
     port_val = (shares * px_eff[present]).sum(axis=1)
     first_mv = port_val[port_val > 0].first_valid_index()
     port_val = port_val.loc[first_mv:].dropna()
 
-    # Benchmark: reindicizza sull'intero calendario del portafoglio dalla prima MV>0
     bench_raw = px[bench].copy()
+    # Riallinea il benchmark all'esatto calendario del portafoglio
     bench_val = bench_raw.reindex(port_val.index).bfill().ffill()
 
-    # CASH FLOWS
+    # --- CASH FLOWS
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if d_eff in cf.index:
             cf.loc[d_eff] += qty * (px_eff_trade)
 
-    # TWR base 100
+    # --- TWR base 100
     twr_ret = []
     dates = port_val.index
     for i in range(1, len(dates)):
@@ -435,15 +486,15 @@ def analyze_portfolio_from_text(
     port_idx = (1 + twr_ret).cumprod() * 100.0
     port_idx = pd.concat([pd.Series([100.0], index=dates[:1]), port_idx])
 
-    # Benchmark base 100 (prezzi)
+    # --- Benchmark base 100 (prezzi)
     bench_ret = bench_val.pct_change()
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
 
-    # RF daily
+    # --- RF daily
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
-    # PME (replica flussi sul benchmark)
+    # --- PME (replica flussi sul benchmark)
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -454,7 +505,7 @@ def analyze_portfolio_from_text(
         bench_pme_val.append(units * px_b)
     bench_pme_val = pd.Series(bench_pme_val, index=port_val.index)
 
-    # RISK METRICS 12m
+    # --- RISK 12m
     lb = TRADING_DAYS
 
     port_r_12m = (twr_ret.iloc[-lb:] if len(twr_ret) >= lb else twr_ret.dropna()).copy()
@@ -482,9 +533,10 @@ def analyze_portfolio_from_text(
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
-    # Grafico (compatibile col tuo endpoint /plot)
+    # --- Grafico: salviamo due nomi (compat con /plot)
     os.makedirs(outdir, exist_ok=True)
     out_hist_main = os.path.join(outdir, "crescita_cumulata.png")
+    out_hist_copy = os.path.join(outdir, "01_crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
     plt.plot(port_idx, label="Portafoglio (TWR, base 100)")
     plt.plot(bench_idx, label=f"Benchmark {bench} (prezzo, base 100)")
@@ -495,9 +547,13 @@ def analyze_portfolio_from_text(
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_hist_main, dpi=160)
+    try:
+        plt.savefig(out_hist_copy, dpi=160)
+    except Exception:
+        pass
     plt.close()
 
-    # Summary
+    # --- SUMMARY (stesso formato del locale)
     contrib = cf.clip(upper=0) * -1.0
     withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
@@ -544,14 +600,14 @@ def analyze_portfolio_from_text(
     for k, v in rows:
         summary_lines.append(f"{k.ljust(45)} {v}")
 
+    # Salva summary anche su file (comodo per debug)
     out_sum = os.path.join(outdir, "02_summary.txt")
     with open(out_sum, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
     return {
         "summary_lines": summary_lines,
-        "plot_path": out_hist_main,
-        "summary_path": out_sum,
+        "plot_path": out_hist_main,  # "/tmp/outputs/crescita_cumulata.png" per /plot
         "risk": {
             "vol_port_12m": vol_port_12m,
             "vol_bench_12m": vol_bench_12m,
@@ -563,12 +619,20 @@ def analyze_portfolio_from_text(
             "var95_bench_usd": var95_bench_usd,
         },
         "pme": {
+            "r_net_port": r_net_port,
+            "r_net_bench": r_net_bench,
+            "r_net_excess": r_net_excess,
+            "irr_port": irr_port,
+            "irr_bench": irr_bench,
+            "irr_excess": irr_excess,
             "current_value_port": current_value_port,
             "current_value_bench_pme": current_value_bench_pme,
+            "net_invested": float(cf.sum()),
         },
         "meta": {
             "mode": "adjclose" if use_adjclose else "close",
             "rf_meta": rf_meta,
             "bench": bench,
+            "start_first_trade": str(first_tx_date.date()),
         },
     }
