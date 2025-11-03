@@ -410,15 +410,15 @@ def analyze_portfolio_from_text(
         if pos < len(shares.index):
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-    # VALORI
-    port_val = (shares * px_eff[present]).sum(axis=1)
-    first_mv = port_val[port_val > 0].first_valid_index()
-    port_val = port_val.loc[first_mv:].dropna()
+# --- VALORI
+port_val = (shares * px_eff[present]).sum(axis=1)
+first_mv = port_val[port_val > 0].first_valid_index()
+port_val = port_val.loc[first_mv:].dropna()
 
-    bench_val = px[bench].loc[port_val.index[0]:].dropna()
-    idx_common = port_val.index.intersection(bench_val.index)
-    port_val = port_val.loc[idx_common]
-    bench_val = bench_val.loc[idx_common]
+# Benchmark definito su TUTTO il calendario del portafoglio, dalla prima operazione.
+# Se il bench parte dopo, facciamo backfill con il primo prezzo disponibile.
+bench_raw = px[bench].copy()
+bench_val = bench_raw.reindex(port_val.index).bfill().ffill()
 
     # CASH FLOWS
     cf = pd.Series(0.0, index=port_val.index)
