@@ -21,6 +21,10 @@ def add_cors_headers(resp):
 
 @app.after_request
 def after_request(response):
+    # Evita caching aggressivo del browser/CDN sul PNG
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     return add_cors_headers(response)
 
 @app.route("/", methods=["GET"])
@@ -42,26 +46,24 @@ def analyze():
     try:
         data = request.get_json(silent=True)
         if data is None:
-            resp = jsonify({"ok": False, "error": "Body JSON mancante o non valido"})
-            return add_cors_headers(resp), 400
+            return add_cors_headers(jsonify({"ok": False, "error": "Body JSON mancante o non valido"})), 400
 
-        lots_text = data.get("lots_text", "")
-        bench = data.get("bench", "")
+        lots_text    = data.get("lots_text", "")
+        bench        = data.get("bench", "")
         use_adjclose = bool(data.get("use_adjclose", False))
-        rf_source = str(data.get("rf_source", "fred_1y"))
-        rf = float(data.get("rf", 0.0))
+        rf_source    = str(data.get("rf_source", "fred_1y"))
+        rf           = float(data.get("rf", 0.0))
         start_buffer_days = int(data.get("start_buffer_days", 7))
+        data_source  = str(data.get("data_source", "auto"))
 
         if not lots_text.strip():
-            resp = jsonify({"ok": False, "error": "lots_text mancante"})
-            return add_cors_headers(resp), 400
+            return add_cors_headers(jsonify({"ok": False, "error": "lots_text mancante"})), 400
         if not bench.strip():
-            resp = jsonify({"ok": False, "error": "bench mancante"})
-            return add_cors_headers(resp), 400
+            return add_cors_headers(jsonify({"ok": False, "error": "bench mancante"})), 400
 
         logger.info(
-            "Analyze called | bench=%s | use_adjclose=%s | rf_source=%s | rf=%.4f | chars(lots)=%d",
-            bench, use_adjclose, rf_source, rf, len(lots_text)
+            "Analyze called | bench=%s | use_adjclose=%s | rf_source=%s | rf=%.4f | start_buffer_days=%s | data_source=%s | chars(lots)=%d",
+            bench, use_adjclose, rf_source, rf, start_buffer_days, data_source, len(lots_text)
         )
 
         result = run_full_analysis(
@@ -71,6 +73,7 @@ def analyze():
             rf_source=rf_source,
             rf=rf,
             start_buffer_days=start_buffer_days,
+            data_source=data_source,
         )
 
         resp = jsonify({"ok": True, **result})
@@ -78,7 +81,7 @@ def analyze():
 
     except Exception as e:
         logger.exception("Errore in /analyze")
-        resp = jsonify({"ok": False, "error": str(e)})
+        resp = jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()})
         return add_cors_headers(resp), 500
 
 @app.route("/plot", methods=["GET", "OPTIONS"])
@@ -87,11 +90,24 @@ def get_plot():
         resp = make_response("", 204)
         return add_cors_headers(resp)
     try:
-        plot_path = "/tmp/outputs/crescita_cumulata.png"
-        if not os.path.exists(plot_path):
-            return add_cors_headers(jsonify({"ok": False, "error": "Plot non disponibile. Esegui prima /analyze."})), 404
-        resp = send_file(plot_path, mimetype="image/png", as_attachment=False)
-        return add_cors_headers(resp), 200
+        # preferisci il nome usato dallo script locale
+        candidates = [
+            "/tmp/outputs/01_crescita_cumulata.png",
+            "/tmp/outputs/crescita_cumulata.png",
+        ]
+        plot_path = next((p for p in candidates if os.path.exists(p)), None)
+
+        if not plot_path:
+            return add_cors_headers(jsonify({
+                "ok": False,
+                "error": "Plot non disponibile. Esegui prima /analyze."
+            })), 404
+
+        resp = send_file(plot_path, mimetype="image/png", as_attachment=False,
+                         download_name=os.path.basename(plot_path))
+        # CORS headers sono aggiunti da after_request
+        return resp, 200
+
     except Exception as e:
         logger.exception("Errore in /plot")
         resp = jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()})
