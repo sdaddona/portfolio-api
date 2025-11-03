@@ -19,7 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Optional deps (gestiti con try per ambienti cloud)
+# Optional deps
 try:
     import yfinance as yf
 except Exception:
@@ -30,7 +30,7 @@ try:
 except Exception:
     pdr = None
 
-import requests  # per Stooq/EODHD
+import requests  # Stooq/EODHD
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -116,7 +116,6 @@ def read_lots_from_text(lots_text: str) -> pd.DataFrame:
     sample = "\n".join(lines)
 
     def _try(buf, header=None):
-        # separatori: più spazi, tab, virgole, punto e virgola
         return pd.read_csv(buf, sep=r"[,\t;]+|\s{2,}", engine="python", header=header, comment="#")
 
     buf = StringIO(sample)
@@ -132,7 +131,7 @@ def read_lots_from_text(lots_text: str) -> pd.DataFrame:
         df = df.iloc[:, :4]
 
     first = " ".join(str(x).lower() for x in df.iloc[0].tolist())
-    if any(k in first for k in ["ticker", "symbol", "simbolo", "data", "date", "quantita", "quantità", "qty", "prezzo", "price", "px"]):
+    if any(k in first for k in ["ticker","symbol","simbolo","data","date","quantita","quantità","qty","prezzo","price","px"]):
         buf = StringIO(sample)
         df = _try(buf, header=0)
         if df.shape[1] > 4:
@@ -142,13 +141,13 @@ def read_lots_from_text(lots_text: str) -> pd.DataFrame:
     posmap = {0: "ticker", 1: "data", 2: "quantità", 3: "prezzo"}
     name_map = {}
     for i, c in enumerate(df.columns):
-        if c in ("ticker", "symbol", "simbolo"):
+        if c in ("ticker","symbol","simbolo"):
             name_map[c] = "ticker"
-        elif c in ("data", "date"):
+        elif c in ("data","date"):
             name_map[c] = "data"
-        elif c in ("quantità", "quantita", "qty", "qta", "quantity"):
+        elif c in ("quantità","quantita","qty","qta","quantity"):
             name_map[c] = "quantità"
-        elif c in ("prezzo", "price", "px"):
+        elif c in ("prezzo","price","px"):
             name_map[c] = "prezzo"
         else:
             name_map[c] = posmap[i]
@@ -177,7 +176,6 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
         return rf_daily, rf_meta
 
     if rf_source == "irx_13w":
-        # Yahoo ^IRX se disponibile
         s = None
         if yf is not None:
             try:
@@ -197,14 +195,13 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
             rf_daily = rf_annual / TRADING_DAYS
             return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
 
-        # fallback
         rf_daily = pd.Series(0.0, index=index)
         return rf_daily, "RF fallback 0.00% (IRX download failed)"
 
-    # default: FRED DGS1
+    # default FRED DGS1
     if pdr is not None:
         try:
-            fred = pdr.DataReader("DGS1", "fred", index[0] - pd.Timedelta(days=10), index[-1] + pd.Timedelta(days=3))
+            fred = pdr.DataReader("DGS1", "fred", index[0]-pd.Timedelta(days=10), index[-1]+pd.Timedelta(days=3))
             ser = fred["DGS1"].rename("DGS1").sort_index()
             ser = ser.reindex(index).ffill()
             rf_annual = ser / 100.0
@@ -217,7 +214,7 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
     return rf_daily, "RF fallback 0.00% (FRED DGS1 download failed)"
 
 # -----------------------------------------------------------------------------
-# Downloader prezzi (multi-sorgente con cache e “period=max”)
+# Downloader prezzi (multi-sorgente + cache)
 # -----------------------------------------------------------------------------
 
 _STQ_SUFFIXES = ["", ".US", ".L", ".MI"]
@@ -302,11 +299,7 @@ def _download_yahoo(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool,
         ysym = f"{sym}{suff}"
         try:
             if use_period_max:
-                h = yf.Ticker(ysym).history(
-                    period="max",
-                    interval="1d",
-                    auto_adjust=True if adj else False,
-                )
+                h = yf.Ticker(ysym).history(period="max", interval="1d", auto_adjust=True if adj else False)
             else:
                 h = yf.Ticker(ysym).history(
                     start=start - pd.Timedelta(days=2),
@@ -326,35 +319,33 @@ def _download_yahoo(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool,
     return None
 
 def download_price_series(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Optional[pd.Series]:
-    # cache
     cached = _load_cache(sym, start, end, use_adjclose)
     if cached is not None and not cached.empty:
         return cached
 
-    # primo pass: Stooq -> EODHD -> Yahoo (finestra richiesta)
     s = _download_stooq(sym, start, end)
     if s is None or s.empty:
         s = _download_eodhd(sym, start, end)
     if (s is None or s.empty) and yf is not None:
         s = _download_yahoo(sym, start, end, use_adjclose, use_period_max=False)
 
-    # se la serie parte dopo la prima operazione o è assente, secondo pass "max"
-    need_second_pass = (s is None or s.empty) or (s.index.min() > pd.Timestamp(start.date()))
-    if need_second_pass and yf is not None:
-        s2 = _download_yahoo(sym, start, end, use_adjclose, use_period_max=True)
-        if s2 is not None and not s2.empty:
-            s = s2
+    # Secondo pass “period=max” se parte troppo tardi
+    if (s is None or s.empty) or (s.index.min() > pd.Timestamp(start.date())):
+        if yf is not None:
+            s2 = _download_yahoo(sym, start, end, use_adjclose, use_period_max=True)
+            if s2 is not None and not s2.empty:
+                s = s2
 
     if s is None or s.empty:
         return None
 
     s = s.asfreq("B").ffill()
     _save_cache(sym, start, end, use_adjclose, s)
-    time.sleep(0.35)  # rate limit gentile
+    time.sleep(0.35)
     return s
 
 # -----------------------------------------------------------------------------
-# Analisi principale (identica al locale, con controlli storia)
+# Analisi principale
 # -----------------------------------------------------------------------------
 
 def analyze_portfolio_from_text(
@@ -368,68 +359,55 @@ def analyze_portfolio_from_text(
 ) -> Dict:
     os.makedirs(outdir, exist_ok=True)
 
-    # --- LOTTI
+    # LOTTI
     lots = read_lots_from_text(lots_text)
     first_tx_date = lots["data"].min()
     bench = (bench or "VT").upper()
 
-    # --- TICKER LIST
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
 
-    # --- Finestra prezzi
+    # Finestra prezzi
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
 
-    # --- Primo pass download
+    # Download
     series: Dict[str, pd.Series] = {}
     for sym in tickers:
         s = download_price_series(sym, start, end, use_adjclose)
         if s is not None and not s.empty:
             series[sym] = s.rename(sym).sort_index().ffill()
 
-    # --- Secondo pass per assicurare storia dalla prima operazione
-    first_trade_by_sym = lots.groupby("ticker")["data"].min().to_dict()
-    missing_or_short: List[str] = []
-    for sym in tickers:
-        first_trade = first_trade_by_sym.get(sym)
-        if first_trade is None:
-            continue
-        s = series.get(sym)
-        if (s is None) or s.empty:
-            missing_or_short.append(sym)
-        else:
-            s_start = pd.Timestamp(s.index.min().date())
-            if s_start > pd.Timestamp(first_trade.date()):
-                missing_or_short.append(sym)
-
-    if missing_or_short:
-        for sym in missing_or_short:
-            s2 = download_price_series(sym, start, end, use_adjclose)
-            if s2 is not None and not s2.empty:
-                series[sym] = s2.rename(sym).sort_index().ffill()
-
-    # --- Verifiche dure: benchmark e early trades
+    # Benchmark deve esserci
     if bench not in series or series[bench].empty:
         raise RuntimeError(f"Benchmark {bench} non disponibile su alcuna fonte. Impossibile calcolare PME.")
 
-    early_trades = [sym for sym, d0 in first_trade_by_sym.items() if d0 <= first_tx_date]
-    if early_trades:
-        early_missing = [
-            sym for sym in early_trades
-            if (sym not in series) or series[sym].empty
-            or (pd.Timestamp(series[sym].index.min().date()) > pd.Timestamp(first_trade_by_sym[sym].date()))
-        ]
-        if early_missing:
-            raise RuntimeError(
-                "Storico insufficiente per partire dalla prima operazione. "
-                f"Ticker con storia mancante o troppo corta: {sorted(set(early_missing))}."
-            )
+    # Tolleranza storia per i ticker “early”
+    first_trade_by_sym = lots.groupby("ticker")["data"].min().to_dict()
+    tolerance_days = start_buffer_days + 5  # tolleranza realistica
+    short_history: List[str] = []
 
-    # --- Costruisci matrice prezzi
+    # Solo i ticker che partono alla data minima globale “devono” avere storia già lì;
+    # per gli altri va bene che inizino quando compaiono nei lotti.
+    global_first = first_tx_date
+
+    for sym, sym_first_trade in first_trade_by_sym.items():
+        s = series.get(sym)
+        if s is None or s.empty:
+            # mancante del tutto: lo segniamo, ma NON blocchiamo (il px_file copre il trade-day)
+            short_history.append(sym)
+            continue
+        s_start = pd.Timestamp(s.index.min().date())
+        # Se questo ticker è tra quelli al minimo globale, richiediamo solo che la prima quotazione
+        # non sia oltre la tolleranza rispetto al suo primo trade.
+        if sym_first_trade == global_first:
+            if s_start > (sym_first_trade + pd.Timedelta(days=tolerance_days)):
+                short_history.append(sym)
+
+    # Matrice prezzi
     px = pd.concat(series.values(), axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
 
-    # --- COSTRUZIONE POSIZIONI (come locale)
+    # COSTRUZIONE POSIZIONI
     calendar = px.index
     trades = []
     for _, r in lots.iterrows():
@@ -445,7 +423,6 @@ def analyze_portfolio_from_text(
 
     px_eff = px.copy()
     if not use_adjclose:
-        # usa il prezzo del file nel giorno trade (identico al locale)
         for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
             if sym in px_eff.columns and d_eff in px_eff.index:
                 px_eff.at[d_eff, sym] = px_file
@@ -459,22 +436,22 @@ def analyze_portfolio_from_text(
         if pos < len(shares.index):
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-    # --- VALORI portafoglio e benchmark
+    # VALORI
     port_val = (shares * px_eff[present]).sum(axis=1)
     first_mv = port_val[port_val > 0].first_valid_index()
     port_val = port_val.loc[first_mv:].dropna()
 
+    # Benchmark riallineato al calendario del portafoglio (parte dalla prima operazione)
     bench_raw = px[bench].copy()
-    # Riallinea il benchmark all'esatto calendario del portafoglio
     bench_val = bench_raw.reindex(port_val.index).bfill().ffill()
 
-    # --- CASH FLOWS
+    # CASH FLOWS
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if d_eff in cf.index:
             cf.loc[d_eff] += qty * (px_eff_trade)
 
-    # --- TWR base 100
+    # TWR base 100
     twr_ret = []
     dates = port_val.index
     for i in range(1, len(dates)):
@@ -486,15 +463,15 @@ def analyze_portfolio_from_text(
     port_idx = (1 + twr_ret).cumprod() * 100.0
     port_idx = pd.concat([pd.Series([100.0], index=dates[:1]), port_idx])
 
-    # --- Benchmark base 100 (prezzi)
+    # Benchmark base 100 (prezzi)
     bench_ret = bench_val.pct_change()
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
 
-    # --- RF daily
+    # RF daily
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
-    # --- PME (replica flussi sul benchmark)
+    # PME (replica flussi sul benchmark)
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -505,9 +482,8 @@ def analyze_portfolio_from_text(
         bench_pme_val.append(units * px_b)
     bench_pme_val = pd.Series(bench_pme_val, index=port_val.index)
 
-    # --- RISK 12m
+    # RISK 12m
     lb = TRADING_DAYS
-
     port_r_12m = (twr_ret.iloc[-lb:] if len(twr_ret) >= lb else twr_ret.dropna()).copy()
     rf_12m = rf_daily.reindex(port_r_12m.index).ffill().fillna(0.0)
     vol_port_12m = np.nan if port_r_12m.empty else float(port_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
@@ -533,7 +509,7 @@ def analyze_portfolio_from_text(
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
-    # --- Grafico: salviamo due nomi (compat con /plot)
+    # Grafico (due nomi compat)
     os.makedirs(outdir, exist_ok=True)
     out_hist_main = os.path.join(outdir, "crescita_cumulata.png")
     out_hist_copy = os.path.join(outdir, "01_crescita_cumulata.png")
@@ -553,7 +529,7 @@ def analyze_portfolio_from_text(
         pass
     plt.close()
 
-    # --- SUMMARY (stesso formato del locale)
+    # SUMMARY
     contrib = cf.clip(upper=0) * -1.0
     withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
@@ -600,14 +576,13 @@ def analyze_portfolio_from_text(
     for k, v in rows:
         summary_lines.append(f"{k.ljust(45)} {v}")
 
-    # Salva summary anche su file (comodo per debug)
     out_sum = os.path.join(outdir, "02_summary.txt")
     with open(out_sum, "w", encoding="utf-8") as f:
         f.write("\n".join(summary_lines))
 
     return {
         "summary_lines": summary_lines,
-        "plot_path": out_hist_main,  # "/tmp/outputs/crescita_cumulata.png" per /plot
+        "plot_path": out_hist_main,
         "risk": {
             "vol_port_12m": vol_port_12m,
             "vol_bench_12m": vol_bench_12m,
@@ -634,5 +609,6 @@ def analyze_portfolio_from_text(
             "rf_meta": rf_meta,
             "bench": bench,
             "start_first_trade": str(first_tx_date.date()),
+            "short_history": sorted(short_history),  # solo informativo
         },
     }
