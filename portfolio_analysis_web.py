@@ -14,42 +14,42 @@ import numpy as np
 import pandas as pd
 
 import matplotlib
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# yfinance come fallback (soggetto a 429 su Render, ma resta utile)
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
+warnings.filterwarnings("ignore", category=UserWarning)
 
-# FRED via pandas-datareader per RF
+# === Sorgente UNICA: Yahoo, come in locale ===
+import yfinance as yf
+
+# FRED per il risk-free (come in locale)
 try:
     from pandas_datareader import data as pdr
 except Exception:
     pdr = None
 
-warnings.filterwarnings("ignore", category=UserWarning)
 TRADING_DAYS = 252
+OUTDIR_DEFAULT = "/tmp/outputs"
 
-# --------------------------- Cache locale ----------------------------
+# --------------------------- Cache ----------------------------
 CACHE_DIR = "/tmp/price_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-def _cache_path(sym: str, key: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{sym}_{key}")
+def _cache_path(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool) -> str:
+    key = f"{sym}_{start.date()}_{end.date()}_{'adj' if adj else 'close'}"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
     return os.path.join(CACHE_DIR, f"{safe}.csv")
 
-def _save_cache_series(sym: str, key: str, s: pd.Series):
+def _save_cache(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool, s: pd.Series):
     try:
         if isinstance(s, pd.Series) and not s.empty:
             df = pd.DataFrame({"date": s.index, "price": s.values})
-            df.to_csv(_cache_path(sym, key), index=False)
+            df.to_csv(_cache_path(sym, start, end, adj), index=False)
     except Exception:
         pass
 
-def _load_cache_series(sym: str, key: str) -> Optional[pd.Series]:
-    pth = _cache_path(sym, key)
+def _load_cache(sym: str, start: pd.Timestamp, end: pd.Timestamp, adj: bool) -> Optional[pd.Series]:
+    pth = _cache_path(sym, start, end, adj)
     if os.path.exists(pth):
         try:
             df = pd.read_csv(pth, parse_dates=["date"])
@@ -60,7 +60,7 @@ def _load_cache_series(sym: str, key: str) -> Optional[pd.Series]:
     return None
 
 def _sleep_jitter(base: float):
-    time.sleep(base + random.uniform(0, 0.4))
+    time.sleep(base + random.uniform(0.1, 0.4))
 
 # --------------------------- Util calcoli ----------------------------
 def to_naive(obj):
@@ -175,24 +175,23 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
         return rf_daily, rf_meta
 
     if rf_source == "irx_13w":
-        tkr = "^IRX"
         try:
-            if yf is None:
-                raise RuntimeError("yfinance non disponibile")
-            h = yf.Ticker(tkr).history(start=index[0]-pd.Timedelta(days=10),
-                                       end=index[-1]+pd.Timedelta(days=3),
-                                       interval="1d", auto_adjust=False)
+            h = yf.Ticker("^IRX").history(
+                start=index[0]-pd.Timedelta(days=10),
+                end=index[-1]+pd.Timedelta(days=3),
+                interval="1d",
+                auto_adjust=False,
+            )
             ser = h["Close"].rename("IRX").sort_index()
             ser = to_naive(ser).reindex(index).ffill()
             rf_annual = ser / 100.0
             rf_daily = rf_annual / TRADING_DAYS
-            rf_meta = "RF: ^IRX (13W T-Bill, ann.)"
-            return rf_daily, rf_meta
+            return rf_daily, "RF: ^IRX (13W T-Bill, ann.)"
         except Exception:
             rf_daily = pd.Series(0.0, index=index)
             return rf_daily, "RF fallback 0.00% (IRX download failed)"
 
-    # default: FRED DGS1 (1-Year Treasury)
+    # default: FRED DGS1
     try:
         if pdr is None:
             raise RuntimeError("pandas_datareader non disponibile")
@@ -201,190 +200,152 @@ def build_rf_daily_series(index: pd.DatetimeIndex, rf_source: str, rf_fixed: flo
         ser = ser.reindex(index).ffill()
         rf_annual = ser / 100.0
         rf_daily = rf_annual / TRADING_DAYS
-        rf_meta = "RF: FRED DGS1 (1Y Treasury, ann.)"
-        return rf_daily, rf_meta
+        return rf_daily, "RF: FRED DGS1 (1Y Treasury, ann.)"
     except Exception:
         rf_daily = pd.Series(0.0, index=index)
         return rf_daily, "RF fallback 0.00% (FRED DGS1 download failed)"
 
-# --------------------------- Downloader: EOD → Yahoo → Stooq ------------------
+# --------------------------- Yahoo Downloader (solo) ---------------------------
 
-_STQ_SUFFIXES = ["", ".US", ".L", ".MI"]  # euristiche per Stooq
-_EOD_SUFFIXES = ["", ".US", ".LSE", ".MI"]  # EOD: LSE/LSE, Milano/MI
+_Y_SUFFIXES = ["", ".US", ".L", ".MI"]  # euristiche come in locale
 
-def _series_first_date(s: Optional[pd.Series]) -> Optional[pd.Timestamp]:
-    if s is None or s.empty:
-        return None
-    return pd.Timestamp(s.index[0])
+def _batch_download_yahoo(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Dict[str, pd.Series]:
+    """
+    Scarica in un colpo solo (riduce i 429 su Render).
+    Ritorna dict {SYM: Series Close}.
+    """
+    # Prova prima senza suffissi
+    data = yf.download(
+        tickers=" ".join(symbols),
+        start=start - pd.Timedelta(days=2),
+        end=end + pd.Timedelta(days=2),
+        interval="1d",
+        auto_adjust=True if use_adjclose else False,
+        progress=False,
+        threads=False,
+        group_by="ticker",
+    )
+    out: Dict[str, pd.Series] = {}
+    if isinstance(data, pd.DataFrame) and not data.empty:
+        # Formati possibili: colonna singola se 1 ticker, MultiIndex se >1
+        if set(["Open", "High", "Low", "Close"]).issubset(set(data.columns)):
+            # singolo
+            s = data["Close"].rename(symbols[0]).sort_index().ffill()
+            out[symbols[0]] = to_naive(s)
+        else:
+            for sym in symbols:
+                try:
+                    s = data[(sym, "Close")].rename(sym).sort_index().ffill()
+                    if not s.empty:
+                        out[sym] = to_naive(s)
+                except Exception:
+                    continue
+    return out
 
-def _download_eod(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Optional[pd.Series]:
-    api_key = os.environ.get("EOD_API_KEY", "").strip()
-    if not api_key:
-        return None
-    import requests
-    field_pref = "adjusted_close" if use_adjclose else "close"
-    for suff in _EOD_SUFFIXES:
-        url = (
-            f"https://eodhistoricaldata.com/api/eod/{sym}{suff}"
-            f"?from={start.date()}&to={end.date()}&period=d&fmt=json&api_token={api_key}"
-        )
-        try:
-            r = requests.get(url, timeout=12)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if not isinstance(data, list) or not data:
-                continue
-            df = pd.DataFrame(data)
-            cols = {c.lower(): c for c in df.columns}
-            if "date" not in {c.lower() for c in df.columns}:
-                continue
-            price_col = cols.get(field_pref) or cols.get("close")
-            if price_col is None:
-                continue
-            df["date"] = pd.to_datetime(df[cols["date"]], errors="coerce")
-            df = df.dropna(subset=["date"]).sort_values("date")
-            s = df.set_index("date")[price_col].astype(float).rename(sym.upper()).sort_index()
-            return to_naive(s)
-        except Exception:
-            continue
-    return None
-
-def _download_yahoo(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Optional[pd.Series]:
-    if yf is None:
-        return None
-    for suff in ["", ".US", ".L", ".MI"]:
+def _single_download_yahoo(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Optional[pd.Series]:
+    for suff in _Y_SUFFIXES:
         ysym = f"{sym}{suff}"
         try:
-            h = yf.download(ysym, start=start - pd.Timedelta(days=2), end=end + pd.Timedelta(days=2),
-                            interval="1d", auto_adjust=True if use_adjclose else False,
-                            progress=False, threads=False)
+            h = yf.download(
+                ysym, start=start - pd.Timedelta(days=2), end=end + pd.Timedelta(days=2),
+                interval="1d", auto_adjust=True if use_adjclose else False,
+                progress=False, threads=False
+            )
             if isinstance(h, pd.DataFrame) and not h.empty and "Close" in h.columns:
-                s = h["Close"].rename(sym.upper()).sort_index().ffill()
+                s = h["Close"].rename(sym).sort_index().ffill()
                 return to_naive(s)
         except Exception:
-            continue
+            pass
         _sleep_jitter(0.6)
     return None
 
-def _download_stooq(sym: str, start: pd.Timestamp, end: pd.Timestamp) -> Optional[pd.Series]:
-    import requests
-    for suff in _STQ_SUFFIXES:
-        url = f"https://stooq.com/q/d/l/?s={sym.lower()}{suff.lower()}&i=d"
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code != 200 or "Date,Open,High,Low,Close,Volume" not in r.text:
-                continue
-            df = pd.read_csv(StringIO(r.text))
-            df.columns = [c.strip().lower() for c in df.columns]
-            if "date" not in df.columns or "close" not in df.columns:
-                continue
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"]).sort_values("date")
-            df = df[(df["date"] >= pd.Timestamp(start.date())) & (df["date"] <= pd.Timestamp(end.date()))]
-            if df.empty:
-                continue
-            s = df.set_index("date")["close"].astype(float).rename(sym.upper()).sort_index()
-            return to_naive(s)
-        except Exception:
-            continue
-    return None
-
-def download_price_series(sym: str, start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Optional[pd.Series]:
+def download_prices_yahoo(symbols: List[str], start: pd.Timestamp, end: pd.Timestamp, use_adjclose: bool) -> Dict[str, pd.Series]:
     """
-    Ordine: CACHE → EOD → Yahoo → Stooq. Ricampiona a 'B' e ffill.
+    Ordine: CACHE → batch (no suffissi) → singoli (con suffissi) → cache last resort.
     """
-    cache_key = f"{sym}-{start.date()}-{end.date()}-{'adj' if use_adjclose else 'close'}"
-    cached = _load_cache_series(sym, cache_key)
-    if cached is not None and not cached.empty:
-        return cached.asfreq("B").ffill()
+    # 0) prova cache prima
+    out: Dict[str, pd.Series] = {}
+    missing: List[str] = []
+    for sym in symbols:
+        cached = _load_cache(sym, start, end, use_adjclose)
+        if cached is not None and not cached.empty:
+            out[sym] = cached
+        else:
+            missing.append(sym)
 
-    # 1) EOD Historical Data
-    s = _download_eod(sym, start, end, use_adjclose)
-    if s is None or s.empty:
-        # 2) Yahoo
-        s = _download_yahoo(sym, start, end, use_adjclose)
-    if s is None or s.empty:
-        # 3) Stooq (ultimo tentativo)
-        s = _download_stooq(sym, start, end)
+    # 1) batch per quelli mancanti
+    if missing:
+        batch = _batch_download_yahoo(missing, start, end, use_adjclose)
+        out.update(batch)
+        still = [s for s in missing if s not in batch]
 
-    if s is None or s.empty:
-        return None
+        # 2) singoli con suffissi
+        for sym in still:
+            s = _single_download_yahoo(sym, start, end, use_adjclose)
+            if s is not None and not s.empty:
+                out[sym] = s
+            _sleep_jitter(0.2)
 
-    s = s.asfreq("B").ffill()
-    _save_cache_series(sym, cache_key, s)
-    _sleep_jitter(0.3)
-    return s
+    # 3) salva cache
+    for sym, s in out.items():
+        _save_cache(sym, start, end, use_adjclose, s.asfreq("B").ffill())
+
+    # 4) normalizza
+    for sym in list(out.keys()):
+        out[sym] = out[sym].asfreq("B").ffill()
+
+    return out
 
 # --------------------------- Analisi principale ---------------------------
 def analyze_portfolio_from_text(
     lots_text: str,
     bench: str,
-    outdir: str = "/tmp/outputs",
+    outdir: str = OUTDIR_DEFAULT,
+    start_buffer_days: int = 7,
     use_adjclose: bool = False,
     rf_source: str = "fred_1y",
     rf: float = 0.0,
-    start_buffer_days: int = 7,
-):
+) -> Dict:
     """
-    Calcoli IDENTICI alla versione locale:
-    - prezzo del file nel giorno del trade se use_adjclose=False
-    - TWR base 100
-    - PME/IRR sul benchmark (stessi flussi, stesse date)
-    - Sharpe/Vol/VaR 12m
+    Logica identica al locale:
+    - Dati SOLO da Yahoo (yfinance) per allineamento pieno.
+    - Se use_adjclose=False, nel giorno del trade si usa il prezzo del file.
+    - Benchmark come PME dai flussi del portafoglio (stesse date/ammontari).
     """
     os.makedirs(outdir, exist_ok=True)
 
-    # LOTTI
+    # --- LOTTI
     lots = read_lots_from_text(lots_text)
     first_tx_date = lots["data"].min()
-    bench = (bench or "").upper().strip()
-    if not bench:
-        raise ValueError("Benchmark mancante.")
+    bench = (bench or "VT").upper().strip()
 
-    # TICKERS
+    # --- TICKER LIST
     tickers = sorted(set(lots["ticker"].tolist()) | {bench})
 
-    # PREZZI (richiesti dall'inizio portafoglio)
+    # --- Finestra prezzi: dall'inizio del portafoglio
     start = pd.Timestamp(first_tx_date.date() - timedelta(days=start_buffer_days))
     end = pd.Timestamp(datetime.today().date() + timedelta(days=2))
 
-    series_map: Dict[str, pd.Series] = {}
-    first_dates: Dict[str, Optional[pd.Timestamp]] = {}
-
-    for sym in tickers:
-        s = download_price_series(sym, start, end, use_adjclose)
-        if s is None or s.empty:
-            # se mancano prezzi per un ETF presente SOLO in anni recenti va bene;
-            # lo escludiamo, ma teniamo traccia per il log
-            first_dates[sym] = None
-            continue
-        series_map[sym] = s.rename(sym).sort_index().ffill()
-        first_dates[sym] = _series_first_date(series_map[sym])
+    # --- Scarico TUTTO da Yahoo in blocco (come locale)
+    series_map = download_prices_yahoo(tickers, start, end, use_adjclose)
 
     # Verifica benchmark
-    if bench not in series_map:
-        # prova un ultimo giro Yahoo lungo (a volte EOD/Stooq falliscono)
-        sb = _download_yahoo(bench, start, end, use_adjclose)
-        if sb is not None and not sb.empty:
-            series_map[bench] = sb.rename(bench).sort_index().ffill()
-            first_dates[bench] = _series_first_date(series_map[bench])
+    if bench not in series_map or series_map[bench].empty:
+        raise RuntimeError(f"Benchmark {bench} non disponibile su Yahoo dal {start.date()}.")
 
-    if bench not in series_map:
-        raise RuntimeError(f"Benchmark {bench} non disponibile su nessuna sorgente dal {start.date()}.")
-
-    # LOG delle prime date utili per capire eventuali tagli
+    # Log prime date disponibili per capire eventuali tagli
     try:
-        printable = {k: (v.date().isoformat() if isinstance(v, pd.Timestamp) else None) for k, v in first_dates.items()}
-        print("Prime date disponibili per serie:", printable)
+        first_dates = {k: (v.index[0].date().isoformat() if v is not None and not v.empty else None)
+                       for k, v in series_map.items()}
+        print("Prime date Yahoo (per serie):", first_dates)
     except Exception:
         pass
 
-    # COSTRUZIONE MATRICE PREZZI su tutti i simboli disponibili
+    # --- MATRICE PREZZI
     px = pd.concat([series_map[s] for s in series_map], axis=1).sort_index().ffill()
     px = to_naive(px).asfreq("B").ffill()
 
-    # COSTRUZIONE POSIZIONI (shares nel tempo)
+    # --- COSTRUZIONE POSIZIONI
     calendar = px.index
     trades: List[Tuple[str, pd.Timestamp, pd.Timestamp, float, float, float]] = []
     for _, r in lots.iterrows():
@@ -392,31 +353,24 @@ def analyze_portfolio_from_text(
         d = r["data"]
         qty = float(r["quantità"])
         px_file = float(r["prezzo"])
-
         if sym not in px.columns:
-            # se un ticker è del tutto indisponibile, lo saltiamo (influisce solo
-            # su periodi in cui sarebbe stato in portafoglio)
             continue
-
         d_eff = map_to_effective_date(d, calendar)
         if d_eff is None:
             continue
         px_eff_trade = float(px.loc[d_eff, sym]) if use_adjclose else px_file
         trades.append((sym, d, d_eff, qty, px_file, px_eff_trade))
 
-    # Copia prezzi per override del trade-day
     px_eff = px.copy()
     if not use_adjclose:
         for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
             if sym in px_eff.columns and d_eff in px_eff.index:
                 px_eff.at[d_eff, sym] = px_file
 
-    # Colonne presenti davvero nei lotti
     present = sorted(set(px_eff.columns) & set(lots["ticker"].unique()))
     if not present:
-        raise RuntimeError("Nessun simbolo dei lotti ha serie prezzo disponibili.")
+        raise RuntimeError("Nessun simbolo dei lotti ha serie prezzo disponibili su Yahoo.")
 
-    # Shares cumulative dal primo giorno del calendario
     shares = pd.DataFrame(0.0, index=px_eff.index, columns=present)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if sym not in shares.columns:
@@ -425,36 +379,34 @@ def analyze_portfolio_from_text(
         if pos < len(shares.index):
             shares.iloc[pos:, shares.columns.get_loc(sym)] += qty
 
-    # VALORI portafoglio
+    # --- VALORI
     port_val = (shares * px_eff[present]).sum(axis=1)
 
-    # Inizio effettivo = primo giorno con MV > 0 *e* benchmark disponibile
+    # Inizio effettivo: primo MV > 0
     first_mv = port_val[port_val > 0].first_valid_index()
-    # Il benchmark viene troncato alla stessa data:
-    bench_val_full = px[bench].copy()
-    # se il benchmark parte dopo first_mv, l'analisi slitta a quella data (come in locale)
-    start_effective = max(
-        first_mv,
-        bench_val_full.first_valid_index()
-    )
-    port_val = port_val.loc[start_effective:].dropna()
-    bench_val = bench_val_full.loc[start_effective:].dropna()
+    if first_mv is None:
+        raise RuntimeError("Portafoglio mai positivo (controlla i lotti).")
 
-    # Se rimane troppo corto, segnala CHI sta tagliando
-    if (len(port_val) < 10) or (len(bench_val) < 10):
+    # Il benchmark DEVE esistere da first_mv (come nel locale)
+    bench_val_full = px[bench].copy()
+    if bench_val_full.first_valid_index() is None or bench_val_full.first_valid_index() > first_mv:
+        bk_first = bench_val_full.first_valid_index()
         raise RuntimeError(
-            f"Storico insufficiente per partire dalla prima operazione: "
-            f"benchmark primo dato={bench_val_full.first_valid_index().date() if bench_val_full.first_valid_index() else None}, "
-            f"portafoglio primo MV={first_mv.date() if first_mv else None}."
+            f"Lo storico Yahoo per {bench} parte il {bk_first.date() if bk_first else 'N/A'}, "
+            f"ma il portafoglio parte il {first_mv.date()}. Serve una sorgente Yahoo completa (come in locale)."
         )
 
-    # CASH FLOWS (sulle date del calendario effettivo)
+    # Allinea entrambi da first_mv
+    port_val = port_val.loc[first_mv:].dropna()
+    bench_val = bench_val_full.loc[first_mv:].dropna()
+
+    # --- CASH FLOWS (date del calendario effettivo)
     cf = pd.Series(0.0, index=port_val.index)
     for sym, d0, d_eff, qty, px_file, px_eff_trade in trades:
         if d_eff in cf.index:
             cf.loc[d_eff] += qty * (px_eff_trade)
 
-    # TWR base 100
+    # --- TWR base 100
     twr_ret = []
     dates = port_val.index
     for i in range(1, len(dates)):
@@ -466,15 +418,15 @@ def analyze_portfolio_from_text(
     port_idx = (1 + twr_ret).cumprod() * 100.0
     port_idx = pd.concat([pd.Series([100.0], index=dates[:1]), port_idx])
 
-    # Benchmark base 100 (semplice prezzo)
+    # --- Benchmark base 100
     bench_ret = bench_val.pct_change()
     bench_idx = (1 + bench_ret.iloc[1:]).cumprod() * 100.0
     bench_idx = pd.concat([pd.Series([100.0], index=bench_val.index[:1]), bench_idx])
 
-    # RF daily
+    # --- RF daily
     rf_daily, rf_meta = build_rf_daily_series(twr_ret.index, rf_source, rf)
 
-    # PME (replica flussi nel benchmark)
+    # --- PME (replica dei flussi nel benchmark)
     bench_pme_val = []
     units = 0.0
     for t in port_val.index:
@@ -485,10 +437,9 @@ def analyze_portfolio_from_text(
         bench_pme_val.append(units * px_b)
     bench_pme_val = pd.Series(bench_pme_val, index=port_val.index)
 
-    # RISK METRICS 12m
+    # --- RISK 12m
     lb = TRADING_DAYS
 
-    # Portafoglio
     port_r_12m = (twr_ret.iloc[-lb:] if len(twr_ret) >= lb else twr_ret.dropna()).copy()
     rf_12m = rf_daily.reindex(port_r_12m.index).ffill().fillna(0.0)
     vol_port_12m = np.nan if port_r_12m.empty else float(port_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
@@ -502,7 +453,6 @@ def analyze_portfolio_from_text(
     current_value_port = float(port_val.iloc[-1])
     var95_usd = np.nan if np.isnan(var95_pct) else var95_pct * current_value_port
 
-    # Benchmark (12m)
     bench_r_12m = (bench_ret.iloc[-lb:] if len(bench_ret) >= lb else bench_ret.dropna()).copy()
     rf_12m_b = rf_daily.reindex(bench_r_12m.index).ffill().fillna(0.0)
     vol_bench_12m = np.nan if bench_r_12m.empty else float(bench_r_12m.std(ddof=1) * np.sqrt(TRADING_DAYS))
@@ -515,10 +465,10 @@ def analyze_portfolio_from_text(
     var95_bench_pct = np.nan if np.isnan(sigma_1d_b) else z_95 * sigma_1d_b
     var95_bench_usd = np.nan if np.isnan(var95_bench_pct) else var95_bench_pct * current_value_bench_pme
 
-    # GRAFICI (salva nel path atteso da /plot e nel nome "01_" come in locale)
+    # --- Grafico
     os.makedirs(outdir, exist_ok=True)
-    out_hist_plot = os.path.join(outdir, "crescita_cumulata.png")      # usato da /plot
-    out_hist_copy = os.path.join(outdir, "01_crescita_cumulata.png")   # compat locale
+    out_hist_main = os.path.join(outdir, "crescita_cumulata.png")   # usato da /plot
+    out_hist_copy = os.path.join(outdir, "01_crescita_cumulata.png")
     plt.figure(figsize=(10, 6))
     plt.plot(port_idx, label="Portafoglio (TWR, base 100)")
     plt.plot(bench_idx, label=f"Benchmark {bench} (prezzo, base 100)")
@@ -528,20 +478,24 @@ def analyze_portfolio_from_text(
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(out_hist_plot, dpi=160)
+    plt.savefig(out_hist_main, dpi=160)
     try:
         plt.savefig(out_hist_copy, dpi=160)
     except Exception:
         pass
     plt.close()
 
-    # SUMMARY
+    # --- SUMMARY
     contrib = cf.clip(upper=0) * -1.0
     withdrw = cf.clip(lower=0)
     gross_contrib = float(contrib.sum())
     gross_withdrw = float(withdrw.sum())
     net_invested = float(cf.sum())
     current_value_pme = float(bench_pme_val.iloc[-1])
+
+    def fmt_pct(x):
+        return "n/a" if (x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x)))) else f"{x:.2%}"
+    def money(x): return f"{x:,.2f} USD"
 
     r_net_port = (current_value_port / net_invested - 1) if net_invested > 0 else np.nan
     r_net_bench = (current_value_pme / net_invested - 1) if net_invested > 0 else np.nan
@@ -553,10 +507,6 @@ def analyze_portfolio_from_text(
     irr_port = xirr(cf_port)
     irr_bench = xirr(cf_bench)
     irr_excess = (irr_port - irr_bench) if (np.isfinite(irr_port) and np.isfinite(irr_bench)) else np.nan
-
-    def fmt_pct(x):
-        return "n/a" if (x is None or (isinstance(x, float) and (np.isnan(x) or not np.isfinite(x)))) else f"{x:.2%}"
-    def money(x): return f"{x:,.2f} USD"
 
     summary_lines = []
     summary_lines.append("=== SUMMARY (Benchmark Equivalente, coerente) ===")
@@ -576,8 +526,8 @@ def analyze_portfolio_from_text(
         ("Current Value – Bench (PME)", money(current_value_pme)),
         ("Volatility 12m (ann.) – Portfolio", fmt_pct(vol_port_12m)),
         ("Volatility 12m (ann.) – Benchmark", fmt_pct(vol_bench_12m)),
-        (f"Sharpe 12m – Portfolio [{rf_meta}]", f"{sharpe_port_12m:.2f}" if np.isfinite(sharpe_port_12m) else "n/a"),
-        (f"Sharpe 12m – Benchmark [{rf_meta}]", f"{sharpe_bench_12m:.2f}" if np.isfinite(sharpe_bench_12m) else "n/a"),
+        ("Sharpe 12m – Portfolio [RF]", f"{(np.sqrt(TRADING_DAYS) * (port_r_12m - rf_12m).mean() / (port_r_12m - rf_12m).std(ddof=1)):.2f}" if (not port_r_12m.empty and (port_r_12m - rf_12m).std(ddof=1) > 0) else "n/a"),
+        ("Sharpe 12m – Benchmark [RF]", f"{(np.sqrt(TRADING_DAYS) * (bench_r_12m - rf_12m_b).mean() / (bench_r_12m - rf_12m_b).std(ddof=1)):.2f}" if (not bench_r_12m.empty and (bench_r_12m - rf_12m_b).std(ddof=1) > 0) else "n/a"),
         ("1D VaR(95%) – Portfolio (pct)", fmt_pct(var95_pct)),
         ("1D VaR(95%) – Portfolio (USD)", money(var95_usd) if np.isfinite(var95_usd) else "n/a"),
         ("1D VaR(95%) – Benchmark (pct)", fmt_pct(var95_bench_pct)),
@@ -592,34 +542,26 @@ def analyze_portfolio_from_text(
 
     return {
         "summary_lines": summary_lines,
-        "plot_path": out_hist_plot,
+        "plot_path": out_hist_main,
         "summary_path": out_sum,
         "risk": {
             "vol_port_12m": vol_port_12m,
             "vol_bench_12m": vol_bench_12m,
-            "sharpe_port_12m": sharpe_port_12m,
-            "sharpe_bench_12m": sharpe_bench_12m,
+            "sharpe_port_12m": np.nan,  # già scritto in summary
+            "sharpe_bench_12m": np.nan, # già scritto in summary
             "var95_pct": var95_pct,
             "var95_usd": var95_usd,
             "var95_bench_pct": var95_bench_pct,
             "var95_bench_usd": var95_bench_usd,
         },
         "pme": {
-            "r_net_port": r_net_port,
-            "r_net_bench": r_net_bench,
-            "r_net_excess": r_net_excess,
-            "irr_port": irr_port,
-            "irr_bench": irr_bench,
-            "irr_excess": irr_excess,
             "current_value_port": current_value_port,
-            "current_value_pme": current_value_pme,
-            "net_invested": net_invested,
+            "current_value_bench_pme": current_value_bench_pme,
         },
         "meta": {
             "mode": "adjclose" if use_adjclose else "close",
             "rf_meta": rf_meta,
             "bench": bench,
-            "first_dates": {k: (v.date().isoformat() if isinstance(v, pd.Timestamp) else None) for k, v in first_dates.items()},
-            "start_effective": start_effective.date().isoformat(),
+            "first_mv": first_mv.date().isoformat(),
         },
     }
